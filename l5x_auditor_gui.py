@@ -3,6 +3,9 @@
 """
 L5X Auditor - análisis estático de proyectos Studio 5000 / Logix Designer (.L5X)
 
+Autor: Joetan Saldaña
+Copyright (c) 2026 Joetan Saldaña. Todos los derechos reservados.
+
 Busca patrones que normalmente indican lógica puenteada, deshabilitada,
 forzada o mal escrita. NO sustituye una revisión manual: cada hallazgo
 hay que confirmarlo en el contexto de la máquina.
@@ -41,8 +44,17 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 __version__ = "2.0.0"
+__author__ = "Joetan Saldaña"
 APP_NAME = "L5X Auditor"
 APP_TITLE = "L5X Auditor - Auditoría de proyectos Studio 5000"
+APP_COPYRIGHT = f"© 2026 {__author__}"
+APP_CREDIT = f"Desarrollado por {__author__}"
+
+
+def resource_path(*parts):
+    """Ruta a un recurso, tanto en el script como dentro del .exe de PyInstaller."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, *parts)
 
 SEVERITIES = ("ALTA", "MEDIA", "BAJA", "INFO")
 SEVERITY_ORDER = {"ALTA": 0, "MEDIA": 1, "BAJA": 2, "INFO": 3}
@@ -735,7 +747,7 @@ def _summary(results, findings):
 def export_json(dest, results, findings):
     total, lines, score, grade = _summary(results, findings)
     data = {
-        "herramienta": APP_NAME, "version": __version__,
+        "herramienta": APP_NAME, "version": __version__, "autor": __author__,
         "generado": datetime.now().isoformat(timespec="seconds"),
         "resumen": {"archivos": len(results), "renglones": lines, "severidad": total,
                     "indice_riesgo": round(score, 2), "calificacion": grade},
@@ -769,12 +781,14 @@ def export_xlsx(dest, results, findings):
     fills = {"ALTA": "FDE2E2", "MEDIA": "FEF3C7", "BAJA": "EDE9FE", "INFO": "EEF2F7"}
     head_fill, head_font = PatternFill("solid", fgColor="1F2937"), Font(bold=True, color="FFFFFF")
     wb = Workbook()
+    wb.properties.creator = __author__
+    wb.properties.title = f"{APP_NAME} - informe de auditoría"
     ws = wb.active
     ws.title = "Resumen"
     total, lines, score, grade = _summary(results, findings)
     ws.append([f"{APP_NAME} {__version__} - informe de auditoría"])
     ws["A1"].font = Font(bold=True, size=14)
-    ws.append([f"Generado: {datetime.now():%Y-%m-%d %H:%M}"])
+    ws.append([f"Generado: {datetime.now():%Y-%m-%d %H:%M}   ·   {APP_CREDIT}"])
     ws.append([])
     head = ["Archivo", "Controlador", "Procesador", "Revisión", "Renglones", "Líneas ST",
             "ALTA", "MEDIA", "BAJA", "INFO", "Índice", "Nota"]
@@ -862,6 +876,7 @@ def export_html(dest, results, findings):
     grade_col = {"A": "#16a34a", "B": "#65a30d", "C": "var(--media)", "D": "#ea580c", "E": "var(--alta)"}
     out = [f"<!doctype html><html lang='es'><head><meta charset='utf-8'>"
            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+           f"<meta name='author' content='{e(__author__)}'>"
            f"<title>Informe de auditoría L5X</title><style>{_HTML_CSS}</style></head><body><div class='wrap'>",
            f"<header><div class='logo'>L5X</div><div><h1>Informe de auditoría L5X</h1>"
            f"<div class='muted'>Generado {datetime.now():%Y-%m-%d %H:%M} &middot; {APP_NAME} {__version__}"
@@ -919,7 +934,9 @@ def export_html(dest, results, findings):
                    f"<td>{e(f.get('status', 'Pendiente'))}</td></tr>")
     out.append("</tbody></table><p class='note'>Este informe es resultado de un análisis estático. Cada "
                "hallazgo debe confirmarse en el contexto de la máquina antes de tomar acciones. AFI y "
-               "OTL sin OTU suelen ser normales.</p></div>")
+               "OTL sin OTU suelen ser normales.</p>"
+               f"<p class='note'>{APP_NAME} {__version__} &middot; {e(APP_CREDIT)} &middot; "
+               f"{e(APP_COPYRIGHT)}</p></div>")
     out.append(f"<script>{_HTML_JS}</script></body></html>")
     with open(dest, "w", encoding="utf-8") as fh:
         fh.write("".join(out))
@@ -1068,7 +1085,7 @@ def cli(argv):
     ap.add_argument("--list-rules", action="store_true", help="listar reglas y salir")
     ap.add_argument("--demo", action="store_true", help="analizar el proyecto de demostración")
     ap.add_argument("--gui", action="store_true", help="abrir la interfaz grafica")
-    ap.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
+    ap.add_argument("--version", action="version", version=f"{APP_NAME} {__version__} - {APP_CREDIT}")
     a = ap.parse_args(argv)
 
     if a.list_rules:
@@ -1381,7 +1398,8 @@ class AuditorApp:
         self.log("Exporta desde Studio 5000: File > Save As > Logix Designer XML File (*.L5X)")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         for seq, fn in (("<Control-o>", self.choose_files), ("<F5>", self.analyze),
-                        ("<Control-f>", self.focus_search), ("<Control-e>", lambda: self.export("html"))):
+                        ("<Control-f>", self.focus_search), ("<Control-e>", lambda: self.export("html")),
+                        ("<F1>", self.about)):
             root.bind(seq, lambda e, fn=fn: fn())
         if dnd:
             try:
@@ -1472,6 +1490,16 @@ class AuditorApp:
         self.show(self.page)
 
     def _set_icon(self):
+        ico, png = resource_path("assets", "l5x_auditor.ico"), resource_path("assets", "l5x_auditor.png")
+        try:
+            if sys.platform == "win32" and os.path.isfile(ico):
+                self.root.iconbitmap(default=ico)
+            if os.path.isfile(png):
+                self._icon = tk.PhotoImage(master=self.root, file=png)
+                self.root.iconphoto(True, self._icon)
+                return
+        except Exception:
+            pass
         try:
             s, P = 32, self.P
             img = tk.PhotoImage(master=self.root, width=s, height=s)
@@ -1535,8 +1563,16 @@ class AuditorApp:
 
         bottom = tk.Frame(side, bg=P["sidebar"])
         bottom.pack(side="bottom", fill="x", padx=18, pady=14)
-        tk.Label(bottom, text=f"v{__version__}  ·  análisis estático", font=F["small"], bg=P["sidebar"],
-                 fg=P["faint"]).pack(anchor="w")
+        credit = [tk.Label(bottom, text="DESARROLLADO POR", font=F["caps"], bg=P["sidebar"], fg=P["faint"]),
+                  tk.Label(bottom, text=__author__, font=F["small_b"], bg=P["sidebar"], fg=P["muted"]),
+                  tk.Label(bottom, text=f"v{__version__}  ·  Acerca de (F1)", font=F["small"],
+                           bg=P["sidebar"], fg=P["faint"])]
+        for w in credit:
+            w.pack(anchor="w")
+            w.configure(cursor="hand2")
+            w.bind("<ButtonRelease-1>", lambda e: self.about())
+        credit[1].bind("<Enter>", lambda e: credit[1].configure(fg=P["accent"]))
+        credit[1].bind("<Leave>", lambda e: credit[1].configure(fg=P["muted"]))
 
         box = tk.Frame(side, bg=P["sidebar"])
         box.pack(fill="both", expand=True, padx=14, pady=(8, 0))
@@ -2507,6 +2543,36 @@ class AuditorApp:
         self.toast(f"Reporte guardado\n{os.path.basename(dest)}", "ok")
         if kind == "html":
             webbrowser.open("file://" + os.path.abspath(dest))
+
+    def about(self):
+        P, F = self.P, self.F
+        win = tk.Toplevel(self.root, bg=P["card"])
+        win.title(f"Acerca de {APP_NAME}")
+        win.resizable(False, False)
+        win.transient(self.root)
+        body = tk.Frame(win, bg=P["card"])
+        body.pack(padx=40, pady=(30, 24))
+        Logo(body, self, size=64, bg=P["card"]).pack()
+        self.label(body, APP_NAME, "h1").pack(pady=(14, 0))
+        self.label(body, f"Versión {__version__}", "small", "muted").pack()
+        self.label(body, "Auditoría estática de proyectos Studio 5000 / Logix Designer (.L5X)",
+                   "body", "muted").pack(pady=(12, 16))
+        tk.Frame(body, bg=P["border"], height=1).pack(fill="x")
+        self.label(body, "DESARROLLADO POR", "caps", "faint").pack(pady=(16, 2))
+        self.label(body, __author__, "h2").pack()
+        self.label(body, f"{APP_COPYRIGHT}. Todos los derechos reservados.", "small", "muted").pack(pady=(2, 16))
+        tk.Frame(body, bg=P["border"], height=1).pack(fill="x")
+        runtime = f"Python {sys.version.split()[0]}  ·  Tk {tk.TkVersion}"
+        runtime += "  ·  Excel " + ("disponible" if xlsx_available() else "no disponible")
+        self.label(body, runtime, "small", "faint").pack(pady=(14, 18))
+        FlatButton(body, self, "Cerrar", win.destroy, kind="primary").pack()
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        win.grab_set()
+        win.focus_set()
 
     def on_close(self):
         self.cfg["geometry"] = self.root.geometry()
