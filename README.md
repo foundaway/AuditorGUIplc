@@ -1,4 +1,8 @@
+<img src="assets/l5x_auditor.png" width="72" align="right" alt="">
+
 # L5X Auditor
+
+**Desarrollado por Joetan Saldaña** · © 2026 Joetan Saldaña. Todos los derechos reservados.
 
 Herramienta de **análisis estático** para proyectos de Rockwell **Studio 5000 / Logix Designer**
 exportados a `.L5X`. Detecta patrones que suelen indicar lógica puenteada, deshabilitada,
@@ -100,11 +104,34 @@ por cada 100 renglones o líneas de ST y se traduce a una nota: **A** (< 2), **B
 
 ## Ejecutable para Windows
 
+En Windows, con Python en el PATH, abre una terminal en la carpeta del proyecto y ejecuta:
+
 ```bat
+build_exe.bat           :: dist\L5X_Auditor.exe  (un solo archivo)
+build_exe.bat onedir    :: dist\L5X_Auditor\     (carpeta; abre más rápido y el antivirus la marca menos)
+```
+
+El ejecutable incluye:
+
+- **Ícono propio** (`assets/l5x_auditor.ico`). Para regenerarlo: `python tools/make_icon.py`.
+- **Datos de autor** de `version_info.txt`, visibles en *clic derecho > Propiedades > Detalles*:
+  compañía y copyright a nombre de Joetan Saldaña, descripción y versión.
+- No hace falta tener Python en el equipo destino.
+
+### Firma digital (opcional)
+
+Windows solo muestra el editor como verificado si el `.exe` está firmado con un **certificado de firma de
+código** (Authenticode) emitido por una autoridad certificadora, como DigiCert, Sectigo o SSL.com.
+Si tienes uno en formato `.pfx` y el Windows SDK instalado (incluye `signtool`), el script lo firma solo:
+
+```bat
+set SIGN_PFX=C:\ruta\certificado.pfx
+set SIGN_PASS=tu_contraseña
 build_exe.bat
 ```
 
-Genera `dist\L5X_Auditor.exe` con PyInstaller. No hace falta tener Python en el equipo destino.
+Sin certificado, el `.exe` se genera igual (con el autor en *Detalles*), pero SmartScreen lo mostrará como
+"editor desconocido".
 
 ## Pruebas
 
