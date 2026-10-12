@@ -23,6 +23,8 @@ forzada o mal escrita, y genera informes listos para compartir.
 - **Flujo de revisión**: marca cada hallazgo como *Confirmado*, *Falso positivo* o *Aceptado* (teclas 1 a 4).
   Los estados se guardan automáticamente y se incluyen en los informes.
 - **Vista de proyecto**: datos del controlador, programas, tareas y las instrucciones que más se usan.
+- **Comparador de versiones**: muestra qué se agregó, eliminó o modificó entre dos L5X del mismo proyecto,
+  con diff lado a lado de rungs y ST. Ver [Comparador](#comparador).
 - **Reglas configurables**: puedes activar o desactivar cada regla, y la selección se recuerda.
 - **Informes** en HTML (interactivo, se puede imprimir), Excel, CSV y JSON.
 - **Modo consola** para automatizar la revisión (por ejemplo en CI), con un código de salida según la severidad.
@@ -94,7 +96,57 @@ python l5x_auditor_gui.py proyecto.L5X --disable JMP --disable AFI
 python l5x_auditor_gui.py proyecto.L5X --fail-on ALTA          # sale con código 2 si hay hallazgos ALTA
 python l5x_auditor_gui.py --list-rules
 python l5x_auditor_gui.py --demo --html demo.html
+python l5x_auditor_gui.py --compare v1.L5X v2.L5X --html cambios.html --xlsx cambios.xlsx
 ```
+
+## Comparador
+
+![Comparador](docs/comparar.png)
+
+La auditoría sigue funcionando con un solo archivo. La página **Comparar** recibe dos: **Base** (la versión
+anterior) y **Nuevo** (la versión a revisar).
+
+- Cada archivo se elige con *Elegir archivo…* o se toma de los ya cargados en la auditoría (*De la auditoría*,
+  o clic derecho sobre un archivo de la lista lateral).
+- La **Base se recuerda** entre sesiones y **Nuevo** se llena solo con el archivo que estás auditando, así que
+  normalmente solo pulsas **Comparar** (`F5` en esa página).
+- *Probar con ejemplo* genera dos versiones del proyecto demo para ver el comparador en acción.
+
+**Qué compara**
+
+| Categoría | Qué detecta |
+|---|---|
+| Controlador | Firmware, procesador, versión de Studio 5000 y demás propiedades |
+| Tareas | Tipo, periodo, prioridad, watchdog, inhibición y programas asignados (en orden) |
+| Programas | Programas agregados o eliminados; rutina principal, de fallas, deshabilitado |
+| Rutinas | Rutinas RLL, ST, FBD y SFC agregadas o eliminadas, cambio de tipo, cambios en FBD/SFC |
+| Rungs | Rungs agregados, eliminados o modificados, con las instrucciones que cambiaron |
+| Comentarios | Comentarios de rung modificados |
+| ST | Líneas de texto estructurado agregadas, eliminadas o modificadas |
+| Tags | De controlador y de programa: tipo de dato, dimensiones, valor inicial, descripción, alias, radix |
+| AOIs | AOIs agregadas o eliminadas, revisión, parámetros y tags locales, y sus rutinas |
+| UDTs | UDTs agregados o eliminados y miembros agregados, eliminados o modificados |
+| Módulos | Catálogo, revisión, IP, RPI, módulo padre, inhibido y keying |
+
+**Cómo decide**
+
+- Los rungs se emparejan **por contenido, no por número**: un rung insertado en medio aparece como un solo
+  *Agregado* y los siguientes, que solo se renumeran, no se marcan como cambiados. Dentro de un bloque
+  cambiado, cada rung se empareja con el más parecido del otro archivo; si se parecen menos de un 50 %, se
+  reportan como eliminado y agregado.
+- **Se ignoran** fechas de export y de modificación, `CommPath`, el orden de los atributos XML, los espacios
+  y sangrías, y los atributos que una versión de Studio 5000 escribe y otra no cuando tienen el valor por omisión.
+- **Valores de tags**: la opción *Ignorar cambios solo de valor* viene activada, porque los valores en vivo
+  (contadores, timers) cambian en cada export. Desactívala para verlos (`--incluir-valores` en consola).
+- Si a uno de los archivos le falta una sección (por ejemplo, un export parcial o de una versión antigua),
+  esa categoría no se compara y se muestra un **aviso** en lugar de reportar todo como eliminado.
+- Las rutinas y AOIs protegidas (*source protection*) solo indican si su contenido cambió.
+- Los archivos se leen en segundo plano: un proyecto de 100,000 rungs se lee y compara en unos 3 segundos
+  sin congelar la ventana.
+
+**Informes**: HTML (filtrable, con el diff de cada cambio) y Excel (hojas *Resumen*, *Cambios* y *Avisos*),
+desde el botón *Exportar* de la barra superior. Con la opción *Exportar solo la vista filtrada* se exporta
+únicamente lo que muestran los filtros.
 
 ## Índice de riesgo
 
@@ -138,6 +190,11 @@ Sin certificado, el `.exe` se genera igual (con el autor en *Detalles*), pero Sm
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+- `tests/test_engine.py`: reglas de auditoría, informes y consola.
+- `tests/test_compare.py`: compara `tests/fixtures/cmp_base.L5X` con `cmp_nuevo.L5X`, que tienen 29 cambios
+  conocidos más diferencias puramente cosméticas, y exige que se detecten exactamente esos 29. También prueba
+  secciones faltantes, exports parciales, rutinas protegidas y un rung insertado en una rutina de 3,000 rungs.
 
 ## Datos locales
 

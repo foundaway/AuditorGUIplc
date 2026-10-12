@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Version "Nuevo" de cmp_base.L5X. Los cambios esperados estan listados en tests/test_compare.py.
+     Tambien incluye diferencias que se deben ignorar: fechas de export y modificacion, CommPath,
+     orden de atributos, sangrias y espacios dentro de rungs y lineas ST. -->
+<RSLogix5000Content ExportDate="Fri Oct 09 17:30:00 2026" SchemaRevision="1.0" SoftwareRevision="33.00" TargetType="Controller" TargetName="LINEA5" ContainsContext="false" ExportOptions="References NoRawData L5KData DecoratedData">
+  <Controller Name="LINEA5" Use="Target" MinorRev="11" MajorRev="33" ProcessorType="1756-L83E" ShareUnusedTimeSlice="1" TimeSlice="20" ProjectCreationDate="Mon Jan 05 09:00:00 2026" LastModifiedDate="Fri Oct 09 17:20:00 2026" CommPath="AB_ETHIP-1\10.0.0.9\Backplane\0">
+    <RedundancyInfo KeepTestEditsOnSwitchOver="false" Enabled="false"/>
+    <Security ChangesToDetect="16#ffff_ffff_ffff_ffff" Code="0"/>
+    <SafetyInfo/>
+    <DataTypes>
+      <DataType Name="UDT_Receta" Family="NoFamily" Class="User">
+        <Description><![CDATA[Receta de producto]]></Description>
+        <Members>
+          <Member Name="ZZZZZZZZZZUDT_Receta0" DataType="SINT" Dimension="0" Radix="Decimal" Hidden="true" ExternalAccess="Read/Write"/>
+          <Member Name="Habilitada" DataType="BIT" Dimension="0" Radix="Decimal" Hidden="false" Target="ZZZZZZZZZZUDT_Receta0" BitNumber="0" ExternalAccess="Read/Write"/>
+          <Member Name="Velocidad" DataType="REAL" Dimension="0" Radix="Float" Hidden="false" ExternalAccess="Read/Write"/>
+          <Member Name="Temperatura" DataType="REAL" Dimension="0" Radix="Float" Hidden="false" ExternalAccess="Read/Write"/>
+        </Members>
+      </DataType>
+    </DataTypes>
+    <Modules>
+      <Module Name="Local" CatalogNumber="1756-L83E" Vendor="1" ProductType="14" ProductCode="168" Major="33" Minor="11" ParentModule="Local" ParentModPortId="1" Inhibited="false" MajorFault="true">
+        <EKey State="Disabled"/>
+        <Ports><Port Id="1" Address="0" Type="ICP" Upstream="false"/></Ports>
+      </Module>
+      <Module Name="ENET_Rack" Vendor="1" CatalogNumber="1756-EN2T/D" ProductType="12" ProductCode="166" Major="11" Minor="1" ParentModule="Local" ParentModPortId="1" Inhibited="false" MajorFault="false">
+        <EKey State="CompatibleModule"/>
+        <Ports>
+          <Port Id="1" Address="2" Type="ICP" Upstream="true"/>
+          <Port Id="2" Address="192.168.1.10" Type="Ethernet" Upstream="false"/>
+        </Ports>
+      </Module>
+      <Module Name="IO_Remoto" CatalogNumber="1734-AENTR/B" Vendor="1" ProductType="12" ProductCode="200" Major="5" Minor="1" ParentModule="ENET_Rack" ParentModPortId="2" Inhibited="false" MajorFault="false">
+        <EKey State="CompatibleModule"/>
+        <Ports>
+          <Port Id="1" Address="0" Type="PointIO" Upstream="false"/>
+          <Port Id="2" Address="192.168.1.21" Type="Ethernet" Upstream="true"/>
+        </Ports>
+        <Communications><Connections>
+          <Connection Name="Rack Optimization" RPI="10000" Type="Output"/>
+        </Connections></Communications>
+      </Module>
+      <Module Name="VFD_Banda" CatalogNumber="PowerFlex 525-EENET" Vendor="1" ProductType="143" ProductCode="9" Major="7" Minor="1" ParentModule="ENET_Rack" ParentModPortId="2" Inhibited="false" MajorFault="false">
+        <EKey State="CompatibleModule"/>
+        <Ports><Port Id="2" Address="192.168.1.30" Type="Ethernet" Upstream="true"/></Ports>
+        <Communications><Connections>
+          <Connection Name="Drive" RPI="20000" Type="Output"/>
+        </Connections></Communications>
+      </Module>
+    </Modules>
+    <AddOnInstructionDefinitions>
+      <AddOnInstructionDefinition Name="AOI_Valvula" Revision="1.1" ExecutePrescan="false" ExecutePostscan="false" ExecuteEnableInFalse="false" CreatedDate="2025-01-01T00:00:00.000Z" CreatedBy="ing" EditedDate="2026-10-01T00:00:00.000Z" EditedBy="otro" SoftwareRevision="v33.00">
+        <Parameters>
+          <Parameter Name="EnableIn" TagType="Base" DataType="BOOL" Usage="Input" Radix="Decimal" Required="false" Visible="false" ExternalAccess="Read Only"/>
+          <Parameter Name="EnableOut" TagType="Base" DataType="BOOL" Usage="Output" Radix="Decimal" Required="false" Visible="false" ExternalAccess="Read Only"/>
+          <Parameter Name="Cmd" TagType="Base" DataType="BOOL" Usage="Input" Radix="Decimal" Required="true" Visible="true" ExternalAccess="Read/Write">
+            <DefaultData Format="L5K"><![CDATA[0]]></DefaultData>
+          </Parameter>
+          <Parameter Name="Abierta" TagType="Base" DataType="BOOL" Usage="Output" Radix="Decimal" Required="false" Visible="true" ExternalAccess="Read Only"/>
+          <Parameter Name="Tiempo_Falla" TagType="Base" DataType="DINT" Usage="Input" Radix="Decimal" Required="false" Visible="true" ExternalAccess="Read/Write">
+            <DefaultData Format="L5K"><![CDATA[5000]]></DefaultData>
+          </Parameter>
+        </Parameters>
+        <LocalTags/>
+        <Routines>
+          <Routine Name="Logic" Type="RLL">
+            <RLLContent>
+              <Rung Number="0" Type="N"><Text><![CDATA[XIC(Cmd) OTE(Abierta);]]></Text></Rung>
+            </RLLContent>
+          </Routine>
+        </Routines>
+      </AddOnInstructionDefinition>
+      <AddOnInstructionDefinition Name="AOI_Motor" Revision="1.0" ExecutePrescan="false" ExecutePostscan="false" ExecuteEnableInFalse="false" SoftwareRevision="v33.00">
+        <Parameters>
+          <Parameter Name="EnableIn" TagType="Base" DataType="BOOL" Usage="Input" Radix="Decimal" Required="false" Visible="false" ExternalAccess="Read Only"/>
+          <Parameter Name="EnableOut" TagType="Base" DataType="BOOL" Usage="Output" Radix="Decimal" Required="false" Visible="false" ExternalAccess="Read Only"/>
+          <Parameter Name="Run" TagType="Base" DataType="BOOL" Usage="Input" Radix="Decimal" Required="true" Visible="true" ExternalAccess="Read/Write"/>
+        </Parameters>
+        <Routines>
+          <Routine Name="Logic" Type="RLL">
+            <RLLContent>
+              <Rung Number="0" Type="N"><Text><![CDATA[XIC(Run)OTE(Out);]]></Text></Rung>
+            </RLLContent>
+          </Routine>
+        </Routines>
+      </AddOnInstructionDefinition>
+    </AddOnInstructionDefinitions>
+    <Tags>
+      <Tag Name="Contador_Piezas" TagType="Base" DataType="DINT" Radix="Decimal" Constant="false" ExternalAccess="Read/Write"><Data Format="L5K"><![CDATA[55]]></Data></Tag>
+      <Tag Name="Velocidad" TagType="Base" DataType="REAL" Radix="Float" Constant="false" ExternalAccess="Read/Write"><Data Format="L5K"><![CDATA[0.00000000e+000]]></Data></Tag>
+      <Tag Name="Recetas" TagType="Base" DataType="UDT_Receta" Dimensions="20" Constant="false" ExternalAccess="Read/Write"/>
+      <Tag Name="Paro_Emergencia" ExternalAccess="Read/Write" Constant="false" Radix="Decimal" DataType="BOOL" TagType="Base">
+        <Description><![CDATA[Paro de emergencia general]]></Description>
+        <Data Format="L5K"><![CDATA[0]]></Data>
+      </Tag>
+      <Tag Name="Sensor_Alias" TagType="Alias" Radix="Decimal" AliasFor="Local:1:I.Data.1" ExternalAccess="Read/Write"/>
+      <Tag Name="Tag_Nuevo" TagType="Base" DataType="BOOL" Radix="Decimal" Constant="false" ExternalAccess="Read/Write"><Data Format="L5K"><![CDATA[0]]></Data></Tag>
+      <Tag Name="Sin_Cambio" TagType="Base" DataType="REAL" Radix="Float" ExternalAccess="Read/Write"><Data Format="L5K"><![CDATA[  1.5  ]]></Data></Tag>
+    </Tags>
+    <Programs>
+      <Program Name="Principal" TestEdits="true" MainRoutineName="MainRoutine" Disabled="false" UseAsFolder="false">
+        <Tags>
+          <Tag Name="Local_Temp" TagType="Base" DataType="DINT" Radix="Decimal" Constant="false" ExternalAccess="Read/Write">
+            <Description><![CDATA[Temporal]]></Description>
+            <Data Format="L5K"><![CDATA[0]]></Data>
+          </Tag>
+        </Tags>
+        <Routines>
+          <Routine Name="MainRoutine" Type="RLL">
+            <RLLContent>
+              <Rung Number="0" Type="N"><Text><![CDATA[JSR(Estacion1,0) JSR(Calculos,0) JSR(Mezcla,0) JSR(Secuencia,0);]]></Text></Rung>
+            </RLLContent>
+          </Routine>
+          <Routine Name="Estacion1" Type="RLL">
+            <RLLContent>
+              <Rung Number="0" Type="N"><Text><![CDATA[XIC(A) OTE(B);]]></Text></Rung>
+              <Rung Number="1" Type="N"><Text><![CDATA[XIC(Nuevo_Permiso)OTE(Z);]]></Text></Rung>
+              <Rung Number="2" Type="N"><Comment><![CDATA[Arranque de motor]]></Comment><Text><![CDATA[XIC(C)XIO(D)OTE(E);]]></Text></Rung>
+              <Rung Number="3" Type="N"><Text><![CDATA[XIC(F)TON(T1,?,?);]]></Text></Rung>
+              <Rung Number="4" Type="N"><Text><![CDATA[XIC(T1.DN)XIC(Permiso)OTE(G);]]></Text></Rung>
+              <Rung Number="5" Type="N"><Text><![CDATA[[XIC(J) ,XIC(K) ]OTE(L);]]></Text></Rung>
+            </RLLContent>
+          </Routine>
+          <Routine Name="Calculos" Type="ST">
+            <STContent>
+              <Line Number="0"><![CDATA[Total :=  A + B;]]></Line>
+              <Line Number="1"><![CDATA[IF Total > 150 THEN]]></Line>
+              <Line Number="2"><![CDATA[    Alarma := 1;]]></Line>
+              <Line Number="3"><![CDATA[END_IF;]]></Line>
+            </STContent>
+          </Routine>
+          <Routine Name="Mezcla" Type="FBD">
+            <FBDContent SheetOrientation="Landscape" SheetSize="Letter - 8.5 x 11 in">
+              <Sheet Number="1">
+                <IRef ID="0" X="100" Y="100" Operand="Flujo_A" HideDesc="false"/>
+                <IRef ID="1" X="100" Y="160" Operand="Flujo_B" HideDesc="false"/>
+                <Block ID="2" Type="ADD" X="240" Y="120" Operand="ADD_01" VisiblePins="SourceA SourceB Dest" HideDesc="false"/>
+                <ORef ID="3" X="400" Y="120" Operand="Flujo_Mezcla" HideDesc="false"/>
+                <Wire FromID="0" ToID="2" ToParam="SourceA"/>
+                <Wire FromID="1" ToID="2" ToParam="SourceB"/>
+                <Wire FromID="2" FromParam="Dest" ToID="3"/>
+              </Sheet>
+            </FBDContent>
+          </Routine>
+          <Routine Name="Secuencia" Type="SFC">
+            <SFCContent SheetSize="Letter - 8.5 x 11 in" SheetOrientation="Landscape" StepName="Step_" TransitionName="Tran_" ActionName="Action_" StopName="Stop_">
+              <Step ID="0" X="100" Y="100" Operand="Step_000" HideDesc="false" DescX="120" DescY="80" DescWidth="0" InitialStep="true" PresetUsesExpr="false" LimitHighUsesExpr="false" LimitLowUsesExpr="false" ShowActions="true"/>
+              <Transition ID="1" X="100" Y="180" Operand="Tran_000" HideDesc="false" DescX="120" DescY="160" DescWidth="0">
+                <Condition><STContent><Line Number="0"><![CDATA[Arranque]]></Line></STContent></Condition>
+              </Transition>
+              <DirectedLink FromID="0" ToID="1" Show="true"/>
+            </SFCContent>
+          </Routine>
+          <Routine Name="Rutina_Nueva" Type="ST">
+            <STContent>
+              <Line Number="0"><![CDATA[Contador_Lotes := Contador_Lotes + 1;]]></Line>
+            </STContent>
+          </Routine>
+        </Routines>
+      </Program>
+      <Program Name="Empaque" TestEdits="false" MainRoutineName="MainRoutine" Disabled="false" UseAsFolder="false">
+        <Routines>
+          <Routine Name="MainRoutine" Type="RLL">
+            <RLLContent>
+              <Rung Number="0" Type="N"><Text><![CDATA[XIC(Caja_Lista)OTE(Sellar);]]></Text></Rung>
+            </RLLContent>
+          </Routine>
+        </Routines>
+      </Program>
+    </Programs>
+    <Tasks>
+      <Task Name="MainTask" Type="CONTINUOUS" Priority="10" Watchdog="500" DisableUpdateOutputs="false" InhibitTask="false">
+        <ScheduledPrograms>
+          <ScheduledProgram Name="Principal"/>
+          <ScheduledProgram Name="Empaque"/>
+        </ScheduledPrograms>
+      </Task>
+      <Task InhibitTask="false" DisableUpdateOutputs="false" Watchdog="500" Priority="5" Rate="10" Type="PERIODIC" Name="Rapida">
+        <ScheduledPrograms/>
+      </Task>
+    </Tasks>
+  </Controller>
+</RSLogix5000Content>
