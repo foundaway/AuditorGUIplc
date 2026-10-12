@@ -17,6 +17,7 @@ Uso:
     python l5x_auditor_gui.py proyecto.L5X --min-sev MEDIA --fail-on ALTA
     python l5x_auditor_gui.py --list-rules
     python l5x_auditor_gui.py --gui proyecto.L5X       # abre la GUI con archivos
+    python l5x_auditor_gui.py --compare v1.L5X v2.L5X --html cambios.html --xlsx cambios.xlsx
 
 Solo usa la biblioteca estándar de Python. Opcionales:
     openpyxl     -> exportar a Excel (.xlsx)
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import hashlib
 import html
 import json
@@ -43,7 +45,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__ = "Joetan Saldaña"
 APP_NAME = "L5X Auditor"
 APP_TITLE = "L5X Auditor - Auditoría de proyectos Studio 5000"
@@ -243,6 +245,15 @@ class Project:
     values: dict = field(default_factory=dict)
     forces: list = field(default_factory=list)
     tag_count: int = 0
+    # Detalle usado por el comparador
+    ctrl_attrs: dict = field(default_factory=dict)     # propiedades del controlador
+    sections: set = field(default_factory=set)         # secciones presentes en el export
+    tag_defs: dict = field(default_factory=dict)       # (alcance, tag) -> propiedades
+    routines: dict = field(default_factory=dict)       # (dueño, rutina) -> contenido
+    aois: dict = field(default_factory=dict)           # nombre -> definicion
+    udts: dict = field(default_factory=dict)           # nombre -> definicion
+    modules: dict = field(default_factory=dict)        # nombre -> propiedades
+    warnings: list = field(default_factory=list)       # avisos de lectura
 
     @property
     def scheduled(self):
@@ -258,9 +269,121 @@ def _has_force(text):
     return bool(re.search(r"[1-9A-Fa-f]", body))
 
 
+# Atributos que cambian en cada export o al guardar y no representan un cambio real.
+IGNORED_ATTRS = {"ExportDate", "LastModifiedDate", "ProjectCreationDate", "Use", "CommPath",
+                 "CreatedDate", "CreatedBy", "EditedDate", "EditedBy", "LastEditedDate", "TestEdits",
+                 "ExportOptions", "SchemaRevision", "ContainsContext"}
+# Secciones del controlador que el comparador espera encontrar
+L5X_SECTIONS = ("DataTypes", "Modules", "AddOnInstructionDefinitions", "Tags", "Programs", "Tasks")
+
+
+def _norm_ws(s):
+    return " ".join((s or "").split())
+
+
+def _text_of(el, child):
+    """Texto de Description/Comment, incluidas las versiones localizadas (v21+)."""
+    c = el.find(child) if el is not None else None
+    if c is None:
+        return ""
+    parts = [(c.text or "").strip()]
+    for loc in c:
+        if loc.text and loc.text.strip():
+            lang = loc.get("Lang")
+            parts.append(f"[{lang}] {loc.text.strip()}" if lang else loc.text.strip())
+    return "\n".join(p for p in parts if p)
+
+
+def _attrs(el, skip=()):
+    return {k: v for k, v in el.attrib.items() if k not in skip and k not in IGNORED_ATTRS}
+
+
+def _canon_lines(el, depth=0, out=None):
+    """Representacion estable, una linea por elemento: no depende del orden de atributos
+    ni de los espacios. Se usa para FBD, SFC y datos en formato decorado."""
+    out = [] if out is None else out
+    for ch in el:
+        if not isinstance(ch.tag, str):
+            continue
+        a = " ".join(f'{k}="{v}"' for k, v in sorted(_attrs(ch).items()))
+        txt = _norm_ws(ch.text)
+        out.append("  " * depth + ch.tag + (" " + a if a else "") + (f" : {txt}" if txt else ""))
+        _canon_lines(ch, depth + 1, out)
+    return out
+
+
+def _data_value(el):
+    """Valor de un tag/parametro: L5K si existe; si no, el formato decorado normalizado."""
+    val = None
+    for data in el.findall("Data") + el.findall("DefaultData"):
+        fmt = data.get("Format")
+        if fmt == "L5K" and data.text and data.text.strip():
+            return _norm_ws(data.text)
+        if val is None and fmt in ("Decorated", "String", None):
+            val = " | ".join(_canon_lines(data)) or _norm_ws(data.text) or None
+    return val
+
+
+def _tag_def(tag, extra=()):
+    d = {k: tag.get(k) for k in ("TagType", "DataType", "Dimensions", "Radix", "AliasFor", "Usage",
+                                 "Constant", "ExternalAccess") + tuple(extra) if tag.get(k) is not None}
+    desc = _text_of(tag, "Description")
+    if desc:
+        d["Description"] = desc
+    val = _data_value(tag)
+    if val:
+        d["Value"] = val
+    return d
+
+
+def _routine_content(rout, owner, proj, program=None):
+    """Lee el contenido de una rutina (RLL, ST, FBD, SFC). Si program se indica, alimenta
+    tambien las listas que usa el auditor."""
+    rname, rtype = rout.get("Name"), rout.get("Type", "RLL")
+    content = {"type": rtype, "rungs": [], "st": [], "graph": [], "encoded": None,
+               "description": _text_of(rout, "Description")}
+    for rung in rout.iter("Rung"):
+        text = (rung.findtext("Text") or "").strip()
+        r = {"program": owner, "routine": rname, "number": rung.get("Number"),
+             "text": text, "comment": _text_of(rung, "Comment")}
+        content["rungs"].append(r)
+        if program is not None and text:
+            program["rungs"] += 1
+            proj.rungs.append(r)
+    st = rout.find("STContent")
+    if st is not None:
+        for line in st.iter("Line"):
+            if line.text and line.text.strip():
+                content["st"].append((line.get("Number"), line.text.rstrip()))
+                if program is not None:
+                    program["st"] += 1
+                    proj.st_lines.append({"program": owner, "routine": rname,
+                                          "number": line.get("Number"), "text": line.text.rstrip()})
+    for tag in ("FBDContent", "SFCContent"):
+        g = rout.find(tag)
+        if g is not None:
+            content["graph"] = _canon_lines(g)
+    return rname, content
+
+
+def _encoded(el):
+    body = "".join(el.itertext())
+    return hashlib.sha1(body.encode("utf-8")).hexdigest()
+
+
+def _parse_xml(path, chunk=1 << 18):
+    """Lee el XML por bloques: con archivos grandes la ventana sigue respondiendo mientras
+    otro hilo lee (ET.parse lo hace en una sola llamada que no suelta el GIL)."""
+    parser = ET.XMLParser()
+    with open(path, "rb") as fh:
+        for data in iter(lambda: fh.read(chunk), b""):
+            parser.feed(data)
+    return parser.close()
+
+
 def load_project(path):
     """Lee un L5X y devuelve un Project."""
-    root = ET.parse(path).getroot()
+    root = _parse_xml(path)
     if root.tag != "RSLogix5000Content":
         raise ValueError(f"No parece un L5X de Studio 5000 (raiz <{root.tag}>)")
     proj = Project(path=path)
@@ -272,20 +395,49 @@ def load_project(path):
         for tag in scope_el.iter("Tag"):
             name = tag.get("Name")
             proj.tag_count += 1
+            proj.tag_defs[(scope_name, name)] = _tag_def(tag)
             for data in tag:
                 if data.tag == "Data" and data.get("Format") == "L5K" and data.text:
                     proj.values[(scope_name, name)] = data.text.strip()
                 elif "Force" in data.tag and _has_force(data.text):
                     proj.forces.append((scope_name, name))
 
+    def guarded(section, fn):
+        try:
+            fn()
+        except Exception as exc:      # una seccion rara no debe tumbar el resto
+            proj.warnings.append(f"No se pudo leer {section}: {exc}")
+
     ctrl = root.find(".//Controller")
-    if ctrl is not None:
+    if ctrl is None:
+        proj.warnings.append("El archivo no contiene el elemento Controller")
+    else:
         for k in ("Name", "ProcessorType", "MajorRev", "MinorRev", "LastModifiedDate"):
             if ctrl.get(k):
                 proj.info[k] = ctrl.get(k)
+        proj.sections = {ch.tag for ch in ctrl if ch.tag in L5X_SECTIONS}
+        ca = _attrs(ctrl)
+        if ca.get("MajorRev") or ca.get("MinorRev"):
+            ca["Firmware"] = f"{ca.pop('MajorRev', '?')}.{ca.pop('MinorRev', '?')}"
+        if root.get("SoftwareRevision"):
+            ca["SoftwareRevision"] = root.get("SoftwareRevision")
+        for child in ("RedundancyInfo", "Security", "SafetyInfo", "TimeSynchronize"):
+            el = ctrl.find(child)
+            if el is not None:
+                ca.update({f"{child}.{k}": v for k, v in _attrs(el).items()})
+        proj.ctrl_attrs = ca
         tags_el = ctrl.find("Tags")
         if tags_el is not None:
-            scan_tags(tags_el, "<controller>")
+            guarded("Tags", lambda: scan_tags(tags_el, "<controller>"))
+        guarded("DataTypes", lambda: _load_udts(ctrl, proj))
+        guarded("AddOnInstructionDefinitions", lambda: _load_aois(ctrl, proj))
+        guarded("Modules", lambda: _load_modules(ctrl, proj))
+        if proj.full_export:
+            missing = [s for s in L5X_SECTIONS if s not in proj.sections]
+            if missing:
+                proj.warnings.append("Secciones ausentes en el export: " + ", ".join(missing))
+        else:
+            proj.warnings.append(f"Export parcial ({proj.info.get('TargetType')}): solo se compara lo incluido")
 
     for prog in root.iter("Program"):
         pname = prog.get("Name")
@@ -294,34 +446,24 @@ def load_project(path):
             "disabled": prog.get("Disabled", "false").lower() == "true",
             "parent": prog.get("Parent"), "class": prog.get("Class", "Standard"),
             "routines": {}, "rungs": 0, "st": 0,
+            "attrs": _attrs(prog, skip=("Name",)), "description": _text_of(prog, "Description"),
         })
         tags_el = prog.find("Tags")
         if tags_el is not None:
             scan_tags(tags_el, pname)
-        for rout in prog.iter("Routine"):
-            rname = rout.get("Name")
-            p["routines"][rname] = rout.get("Type", "RLL")
-            for rung in rout.iter("Rung"):
-                t = rung.find("Text")
-                if t is None or not t.text:
-                    continue
-                p["rungs"] += 1
-                proj.rungs.append({
-                    "program": pname,
-                    "routine": rname,
-                    "number": rung.get("Number"),
-                    "text": t.text.strip(),
-                    "comment": (rung.findtext("Comment") or "").strip(),
-                })
-            st = rout.find("STContent")
-            if st is not None:
-                for line in st.iter("Line"):
-                    if line.text and line.text.strip():
-                        p["st"] += 1
-                        proj.st_lines.append({
-                            "program": pname, "routine": rname,
-                            "number": line.get("Number"), "text": line.text.rstrip(),
-                        })
+        routs = prog.find("Routines")
+        for rout in (routs if routs is not None else []):
+            if rout.tag == "Routine":
+                rname, content = _routine_content(rout, pname, proj, program=p)
+            elif rout.tag == "EncodedData":
+                rname = rout.get("Name")
+                content = {"type": rout.get("Type", "RLL"), "rungs": [], "st": [], "graph": [],
+                           "encoded": _encoded(rout), "description": ""}
+                proj.warnings.append(f"Rutina protegida {pname}/{rname}: solo se detecta si cambio")
+            else:
+                continue
+            p["routines"][rname] = content["type"]
+            proj.routines[(pname, rname)] = content
 
     for task in root.iter("Task"):
         proj.tasks.append({
@@ -329,8 +471,87 @@ def load_project(path):
             "rate": task.get("Rate"), "priority": task.get("Priority"),
             "inhibit": task.get("InhibitTask", "false").lower() == "true",
             "programs": [sp.get("Name") for sp in task.iter("ScheduledProgram")],
+            "attrs": _attrs(task, skip=("Name",)),
         })
     return proj
+
+
+def _load_udts(ctrl, proj):
+    sec = ctrl.find("DataTypes")
+    for dt in (sec if sec is not None else []):
+        if dt.tag != "DataType":
+            continue
+        members = {}
+        for m in dt.iter("Member"):
+            if m.get("Hidden", "false").lower() == "true":
+                continue        # miembros ocultos que Logix genera para empaquetar BOOLs
+            md = {k: m.get(k) for k in ("DataType", "Dimension", "Radix", "ExternalAccess")
+                  if m.get(k) is not None}
+            desc = _text_of(m, "Description")
+            if desc:
+                md["Description"] = desc
+            members[m.get("Name")] = md
+        attrs = _attrs(dt, skip=("Name",))
+        desc = _text_of(dt, "Description")
+        if desc:
+            attrs["Description"] = desc
+        proj.udts[dt.get("Name")] = {"attrs": attrs, "members": members}
+
+
+def _load_aois(ctrl, proj):
+    sec = ctrl.find("AddOnInstructionDefinitions")
+    for aoi in (sec if sec is not None else []):
+        name = aoi.get("Name")
+        attrs = _attrs(aoi, skip=("Name", "SoftwareRevision"))
+        desc = _text_of(aoi, "Description")
+        if desc:
+            attrs["Description"] = desc
+        if aoi.tag == "EncodedData":
+            attrs["Contenido protegido"] = _encoded(aoi)[:12]
+            proj.aois[name] = {"attrs": attrs, "params": {}, "locals": {}, "encoded": True}
+            proj.warnings.append(f"AOI protegida {name}: solo se detecta si cambio")
+            continue
+        if aoi.tag != "AddOnInstructionDefinition":
+            continue
+        params = {p.get("Name"): _tag_def(p, ("Required", "Visible"))
+                  for p in aoi.iter("Parameter")}
+        local = {t.get("Name"): _tag_def(t) for t in aoi.iter("LocalTag")}
+        owner = f"AOI {name}"
+        routs = aoi.find("Routines")
+        for rout in (routs if routs is not None else []):
+            if rout.tag == "Routine":
+                rname, content = _routine_content(rout, owner, proj)
+                proj.routines[(owner, rname)] = content
+        proj.aois[name] = {"attrs": attrs, "params": params, "locals": local, "encoded": False}
+
+
+def _load_modules(ctrl, proj):
+    sec = ctrl.find("Modules")
+    for mod in (sec if sec is not None else []):
+        if mod.tag != "Module":
+            continue
+        d = _attrs(mod, skip=("Name",))
+        ekey = mod.find("EKey")
+        if ekey is not None and ekey.get("State"):
+            d["Keying"] = ekey.get("State")
+        ips = [p.get("Address") for p in mod.iter("Port")
+               if p.get("Type") == "Ethernet" and p.get("Address")]
+        if ips:
+            d["IP"] = ", ".join(ips)
+        rpis = []
+        for c in mod.iter("Connection"):
+            if c.get("RPI"):
+                try:
+                    ms = f"{int(c.get('RPI')) / 1000:g} ms"
+                except ValueError:
+                    ms = c.get("RPI")
+                rpis.append(f"{c.get('Name')}: {ms}" if c.get("Name") else ms)
+        if rpis:
+            d["RPI"] = "; ".join(rpis)
+        name = mod.get("Name") or ""
+        if not name or name.startswith("$NoName"):
+            name = f"(sin nombre) {mod.get('ParentModule', '')}:{mod.get('ParentModPortId', '')}"
+        proj.modules[name] = d
 
 
 def load(path):
@@ -852,7 +1073,7 @@ tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabu
 code{font:12px/1.45 Consolas,"Cascadia Mono",monospace;white-space:pre-wrap;word-break:break-all}
 details summary{cursor:pointer;color:var(--accent);font-size:12px}
 .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0 12px}
-.bar input{flex:1;min-width:220px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text)}
+.bar #q{flex:1;min-width:220px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text)}
 .bar label{font-size:13px;display:flex;gap:4px;align-items:center}
 .note{margin-top:24px;font-size:12px;color:var(--muted)}
 @media print{.bar{display:none}details{display:block}details>summary{display:none}body{background:#fff}}
@@ -945,6 +1166,649 @@ def export_html(dest, results, findings):
 EXPORTERS = {"csv": export_csv, "html": export_html, "json": export_json, "xlsx": export_xlsx}
 
 
+# ------------------------------------------------------------- comparador ----
+CMP_KINDS = ("Agregado", "Eliminado", "Modificado")
+CMP_CATS = ("Controlador", "Tareas", "Programas", "Rutinas", "Rungs", "Comentarios", "ST",
+            "Tags", "AOIs", "UDTs", "Módulos")
+CTRL_SCOPE = "Controlador"
+PROP_LABELS = {
+    "Name": "Nombre", "ProcessorType": "Procesador", "Firmware": "Firmware",
+    "SoftwareRevision": "Versión de software", "TagType": "Tipo de tag", "DataType": "Tipo de dato",
+    "Dimensions": "Dimensiones", "Dimension": "Dimensión", "AliasFor": "Alias de", "Value": "Valor inicial",
+    "Description": "Descripción", "Radix": "Radix", "ExternalAccess": "Acceso externo", "Constant": "Constante",
+    "Usage": "Uso", "Required": "Requerido", "Visible": "Visible", "CatalogNumber": "Catálogo",
+    "IP": "Dirección IP", "RPI": "RPI", "Major": "Revisión mayor", "Minor": "Revisión menor",
+    "ParentModule": "Módulo padre", "ParentModPortId": "Puerto padre", "Inhibited": "Inhibido",
+    "Keying": "Keying", "Vendor": "Fabricante", "ProductType": "Tipo de producto", "ProductCode": "Código de producto",
+    "Revision": "Revisión", "RevisionExtension": "Extensión de revisión", "Type": "Tipo", "Rate": "Periodo (ms)",
+    "Priority": "Prioridad", "Watchdog": "Watchdog (ms)", "InhibitTask": "Tarea inhibida", "Programs": "Programas",
+    "DisableUpdateOutputs": "No actualizar salidas", "MainRoutineName": "Rutina principal",
+    "FaultRoutineName": "Rutina de fallas", "Disabled": "Deshabilitado", "Class": "Clase", "Family": "Familia",
+    "UseAsFolder": "Usar como carpeta", "MajorFault": "Falla mayor si se pierde",
+}
+# Valores por omision: que una version de Studio 5000 escriba el atributo y otra no, no es un cambio.
+PROP_DEFAULTS = {"Constant": "false", "ExternalAccess": "Read/Write", "TagType": "Base", "Inhibited": "false",
+                 "Disabled": "false", "UseAsFolder": "false", "InhibitTask": "false", "MajorFault": "false",
+                 "DisableUpdateOutputs": "false", "Required": "false", "SafetyEnabled": "false"}
+SECTION_CATS = {"Tags": ("Tags",), "DataTypes": ("UDTs",), "AddOnInstructionDefinitions": ("AOIs",),
+                "Modules": ("Módulos",), "Tasks": ("Tareas",),
+                "Programs": ("Programas", "Rutinas", "Rungs", "Comentarios", "ST")}
+_RUNG_TOKEN_RE = re.compile(r"[A-Za-z_]\w*\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|[\[\],;]|[^\s\[\],;]+")
+_WORD_RE = re.compile(r"\w+|\s+|[^\w\s]")
+_PROP_ORDER = {k: i for i, k in enumerate(PROP_LABELS)}
+
+
+def prop_label(k):
+    return PROP_LABELS.get(k, k)
+
+
+def rung_tokens(text):
+    return _RUNG_TOKEN_RE.findall(text or "")
+
+
+def _rkey(text):
+    return re.sub(r"\s+", "", text or "")
+
+
+def _blank(v):
+    return v is None or str(v).strip() == ""
+
+
+def _same(a, b, k):
+    na = PROP_DEFAULTS.get(k, "") if _blank(a) else a
+    nb = PROP_DEFAULTS.get(k, "") if _blank(b) else b
+    return _norm_ws(str(na)).lower() == _norm_ws(str(nb)).lower() if k in PROP_DEFAULTS \
+        else _norm_ws(str(na)) == _norm_ws(str(nb))
+
+
+def _short(v, n=40):
+    s = "(vacío)" if _blank(v) else _norm_ws(str(v))
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _props_table(a, b, ignore=()):
+    """Filas (propiedad, base, nuevo, cambio) con la union de propiedades de ambos lados."""
+    keys = set(a or {}) | set(b or {})
+    rows = []
+    for k in sorted(keys, key=lambda k: (_PROP_ORDER.get(k, 999), k)):
+        if k in ignore:
+            continue
+        va, vb = (a or {}).get(k), (b or {}).get(k)
+        rows.append((k, va, vb, a is not None and b is not None and not _same(va, vb, k)))
+    return rows
+
+
+def _changes_summary(rows):
+    parts = []
+    for k, va, vb, changed in rows:
+        if changed:
+            parts.append("descripción modificada" if k == "Description"
+                         else f"{prop_label(k)}: {_short(va)} → {_short(vb)}")
+    return "; ".join(parts)
+
+
+def _brief(d):
+    keys = ("DataType", "Dimensions", "AliasFor", "Usage", "CatalogNumber", "IP", "Type", "Revision")
+    return ", ".join(f"{prop_label(k)} {_short(d[k], 30)}" for k in keys if not _blank(d.get(k)))
+
+
+def _change(kind, cat, prog="-", rout="-", item="", loc="", detail="", mode=None, base=None, new=None,
+            props=None, key=0):
+    return {"kind": kind, "cat": cat, "prog": prog or "-", "rout": rout or "-", "item": item,
+            "loc": loc, "detail": detail, "mode": mode, "base": base, "new": new,
+            "props": props or [], "key": key}
+
+
+def _cmp_entities(out, cat, a, b, prog="-", label=None, ignore=()):
+    """Compara dos diccionarios nombre -> propiedades (tags, modulos, miembros, ...)."""
+    for name in sorted(set(a) | set(b), key=str.lower):
+        item = label(name) if label else name
+        if name not in a:
+            out.append(_change("Agregado", cat, prog, item=item, detail=_brief(b[name]), mode="props",
+                               props=_props_table(None, b[name], ignore)))
+        elif name not in b:
+            out.append(_change("Eliminado", cat, prog, item=item, detail=_brief(a[name]), mode="props",
+                               props=_props_table(a[name], None, ignore)))
+        else:
+            rows = _props_table(a[name], b[name], ignore)
+            if any(r[3] for r in rows):
+                out.append(_change("Modificado", cat, prog, item=item, detail=_changes_summary(rows),
+                                   mode="props", props=rows))
+
+
+def _num(n):
+    return int(n) + 1 if str(n).isdigit() else n
+
+
+def _text_lines(text):
+    return [(i + 1, line) for i, line in enumerate((text or "").splitlines())]
+
+
+def _routine_lines(c):
+    if c["encoded"]:
+        return [(None, "(contenido protegido)")]
+    if c["rungs"]:
+        return [(r["number"], r["text"]) for r in c["rungs"]]
+    if c["st"]:
+        return [(_num(n), t) for n, t in c["st"]]
+    return list(enumerate(c["graph"], 1))
+
+
+def _routine_brief(c):
+    if c["encoded"]:
+        return f"Rutina {c['type']} protegida"
+    if c["rungs"]:
+        return f"Rutina {c['type']} con {len(c['rungs'])} rungs"
+    if c["st"]:
+        return f"Rutina {c['type']} con {len(c['st'])} líneas"
+    return f"Rutina {c['type']} con {len(c['graph'])} elementos"
+
+
+def _token_delta(ta, tb):
+    sm = difflib.SequenceMatcher(None, [_rkey(t) for t in ta], [_rkey(t) for t in tb], autojunk=False)
+    gone, added = [], []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op in ("delete", "replace"):
+            gone += [t for t in ta[i1:i2] if t not in "[],;"]
+        if op in ("insert", "replace"):
+            added += [t for t in tb[j1:j2] if t not in "[],;"]
+    parts = []
+    if gone:
+        parts.append("quitado " + " ".join(gone))
+    if added:
+        parts.append("agregado " + " ".join(added))
+    return _short("; ".join(parts) or "cambió la estructura de ramas", 160)
+
+
+def _pair_rungs(xs, ys, window=6, threshold=0.5):
+    """Empareja rungs de un bloque cambiado por similitud, conservando el orden.
+    Lo que no tiene pareja se reporta como agregado o eliminado."""
+    def toks(r):
+        return [_rkey(t) for t in rung_tokens(r["text"])]
+    tys = [toks(y) for y in ys]
+    pairs, j = [], 0
+    for x in xs:
+        tx, best, bj = toks(x), 0.0, None
+        for k in range(j, min(len(ys), j + window)):
+            sm = difflib.SequenceMatcher(None, tx, tys[k], autojunk=False)
+            if sm.real_quick_ratio() < threshold or sm.quick_ratio() < threshold:
+                continue
+            r = sm.ratio()
+            if r > best:
+                best, bj = r, k
+        if bj is not None and best >= threshold:
+            pairs += [(None, y) for y in ys[j:bj]] + [(x, ys[bj])]
+            j = bj + 1
+        else:
+            pairs.append((x, None))
+    return pairs + [(None, y) for y in ys[j:]]
+
+
+def _diff_rll(out, owner, rname, A, B):
+    sm = difflib.SequenceMatcher(None, [_rkey(r["text"]) for r in A], [_rkey(r["text"]) for r in B],
+                                 autojunk=False)
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for x, y in zip(A[i1:i2], B[j1:j2]):
+                if _norm_ws(x["comment"]) != _norm_ws(y["comment"]):
+                    out.append(_change(
+                        "Modificado", "Comentarios", owner, rname, item=f"Rung {y['number']}",
+                        loc=_rung_loc(x, y), detail=f"{_short(x['comment'])} → {_short(y['comment'])}",
+                        mode="lines", base=_text_lines(x["comment"]), new=_text_lines(y["comment"]),
+                        key=_rung_key(y["number"])))
+            continue
+        for x, y in _pair_rungs(A[i1:i2], B[j1:j2]):
+            if x is None:
+                out.append(_change("Agregado", "Rungs", owner, rname, item=f"Rung {y['number']}",
+                                   loc=f"Rung {y['number']} (Nuevo)", detail=_short(y["text"], 160),
+                                   mode="tokens", new=y["text"], key=_rung_key(y["number"])))
+            elif y is None:
+                out.append(_change("Eliminado", "Rungs", owner, rname, item=f"Rung {x['number']}",
+                                   loc=f"Rung {x['number']} (Base)", detail=_short(x["text"], 160),
+                                   mode="tokens", base=x["text"], key=_rung_key(x["number"])))
+            else:
+                detail = _token_delta(rung_tokens(x["text"]), rung_tokens(y["text"]))
+                if _norm_ws(x["comment"]) != _norm_ws(y["comment"]):
+                    detail += "; comentario modificado"
+                out.append(_change("Modificado", "Rungs", owner, rname, item=f"Rung {y['number']}",
+                                   loc=_rung_loc(x, y), detail=detail, mode="tokens", base=x["text"],
+                                   new=y["text"], key=_rung_key(y["number"])))
+
+
+def _rung_loc(x, y):
+    return f"Rung {x['number']}" if x["number"] == y["number"] else f"Rung {x['number']} → {y['number']}"
+
+
+def _diff_st(out, owner, rname, A, B):
+    sm = difflib.SequenceMatcher(None, [_norm_ws(t) for _, t in A], [_norm_ws(t) for _, t in B],
+                                 autojunk=False)
+    kinds = {"delete": "Eliminado", "insert": "Agregado", "replace": "Modificado"}
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            continue
+        la = [(_num(n), t) for n, t in A[i1:i2]]
+        lb = [(_num(n), t) for n, t in B[j1:j2]]
+        ref = lb or la
+        first, last = ref[0][0], ref[-1][0]
+        item = f"Línea {first}" if first == last else f"Líneas {first}–{last}"
+        if op == "replace":
+            detail = f"{_short(la[0][1], 60)} → {_short(lb[0][1], 60)}"
+        else:
+            detail = _short(ref[0][1], 120)
+        out.append(_change(kinds[op], "ST", owner, rname, item=item,
+                           loc=item + (" (Base)" if op == "delete" else ""), detail=detail,
+                           mode="lines", base=la, new=lb, key=first if isinstance(first, int) else 0))
+
+
+def _cmp_routine(out, owner, rname, ca, cb):
+    if ca["type"] != cb["type"]:
+        out.append(_change("Modificado", "Rutinas", owner, rname, item=rname,
+                           detail=f"Tipo: {ca['type']} → {cb['type']}", mode="lines",
+                           base=_routine_lines(ca), new=_routine_lines(cb)))
+        return
+    if _norm_ws(ca["description"]) != _norm_ws(cb["description"]):
+        out.append(_change("Modificado", "Rutinas", owner, rname, item=rname, detail="descripción modificada",
+                           mode="props", props=[("Description", ca["description"], cb["description"], True)]))
+    if ca["encoded"] or cb["encoded"]:
+        if ca["encoded"] != cb["encoded"]:
+            out.append(_change("Modificado", "Rutinas", owner, rname, item=rname,
+                               detail="Rutina protegida: el contenido cambió (no se puede mostrar)"))
+        return
+    if ca["rungs"] or cb["rungs"]:
+        _diff_rll(out, owner, rname, ca["rungs"], cb["rungs"])
+    if ca["st"] or cb["st"]:
+        _diff_st(out, owner, rname, ca["st"], cb["st"])
+    if ca["graph"] != cb["graph"]:
+        sm = difflib.SequenceMatcher(None, ca["graph"], cb["graph"], autojunk=False)
+        n = sum(max(i2 - i1, j2 - j1) for op, i1, i2, j1, j2 in sm.get_opcodes() if op != "equal")
+        out.append(_change("Modificado", "Rutinas", owner, rname, item=rname,
+                           detail=f"Contenido {ca['type']} modificado ({n} elementos distintos)", mode="lines",
+                           base=list(enumerate(ca["graph"], 1)), new=list(enumerate(cb["graph"], 1))))
+
+
+def _cmp_routines(out, owner, a, b, names_a, names_b):
+    for r in sorted(set(names_a) | set(names_b), key=str.lower):
+        ca, cb = a.routines.get((owner, r)), b.routines.get((owner, r))
+        if ca is None and cb is None:
+            continue
+        if ca is None:
+            out.append(_change("Agregado", "Rutinas", owner, r, item=r, detail=_routine_brief(cb),
+                               mode="lines", new=_routine_lines(cb)))
+        elif cb is None:
+            out.append(_change("Eliminado", "Rutinas", owner, r, item=r, detail=_routine_brief(ca),
+                               mode="lines", base=_routine_lines(ca)))
+        else:
+            _cmp_routine(out, owner, r, ca, cb)
+
+
+@dataclass
+class CompareResult:
+    base: Project
+    new: Project
+    changes: list
+    warnings: list
+    elapsed: float = 0.0
+    ignore_values: bool = True
+
+    @property
+    def counts(self):
+        c = Counter(ch["kind"] for ch in self.changes)
+        return {k: c.get(k, 0) for k in CMP_KINDS}
+
+    @property
+    def by_cat(self):
+        out = {cat: Counter() for cat in CMP_CATS}
+        for ch in self.changes:
+            out[ch["cat"]][ch["kind"]] += 1
+        return out
+
+
+def compare_projects(a, b, ignore_values=True):
+    """Compara dos Project (Base y Nuevo) y devuelve un CompareResult."""
+    t0 = time.perf_counter()
+    out, warnings, skipped = [], [], set()
+    for w in a.warnings:
+        warnings.append(f"{'Ambos' if w in b.warnings else 'Base'}: {w}")
+    warnings += [f"Nuevo: {w}" for w in b.warnings if w not in a.warnings]
+    for sec, cats in SECTION_CATS.items():
+        in_a, in_b = sec in a.sections, sec in b.sections
+        if in_a != in_b:
+            warnings.append(f"La sección {sec} solo existe en {'Base' if in_a else 'Nuevo'}: "
+                            f"no se comparan {', '.join(cats)}.")
+            skipped.update(cats)
+        elif not in_a:
+            skipped.update(cats)
+    va, vb = (a.ctrl_attrs.get("SoftwareRevision") or "").split(".")[0], \
+             (b.ctrl_attrs.get("SoftwareRevision") or "").split(".")[0]
+    if va and vb and va != vb:
+        warnings.append(f"Los archivos se exportaron con versiones distintas de Studio 5000 (v{va} y v{vb}); "
+                        "se ignoran atributos que solo existen en una de ellas cuando tienen el valor por omisión.")
+
+    # Controlador: un cambio por propiedad
+    for row in _props_table(a.ctrl_attrs, b.ctrl_attrs):
+        if row[3]:
+            out.append(_change("Modificado", "Controlador", item=prop_label(row[0]),
+                               detail=f"{_short(row[1])} → {_short(row[2])}", mode="props", props=[row]))
+    if "Tareas" not in skipped:
+        def tasks(p):
+            return {t["name"]: dict(t["attrs"], Programs=", ".join(t["programs"])) for t in p.tasks}
+        _cmp_entities(out, "Tareas", tasks(a), tasks(b))
+
+    gone_progs = set()
+    if "Programas" not in skipped:
+        for name in sorted(set(a.programs) | set(b.programs), key=str.lower):
+            pa, pb = a.programs.get(name), b.programs.get(name)
+            if pa is None or pb is None:
+                p, proj = (pb, b) if pa is None else (pa, a)
+                ntags = sum(1 for (s, _n) in proj.tag_defs if s == name)
+                attrs = dict(p["attrs"], Description=p["description"]) if p["description"] else p["attrs"]
+                out.append(_change("Agregado" if pa is None else "Eliminado", "Programas", name, item=name,
+                                   detail=f"{len(p['routines'])} rutinas, {p['rungs']} rungs, {ntags} tags",
+                                   mode="props", props=_props_table(None if pa is None else attrs,
+                                                                    attrs if pa is None else None)))
+                gone_progs.add(name)
+                continue
+            rows = _props_table(dict(pa["attrs"], Description=pa["description"]),
+                                dict(pb["attrs"], Description=pb["description"]))
+            if any(r[3] for r in rows):
+                out.append(_change("Modificado", "Programas", name, item=name, detail=_changes_summary(rows),
+                                   mode="props", props=rows))
+            _cmp_routines(out, name, a, b, pa["routines"], pb["routines"])
+
+    ignore = {"Value"} if ignore_values else set()
+    by_scope = (defaultdict(dict), defaultdict(dict))
+    for i, p in enumerate((a, b)):
+        for (scope, name), d in p.tag_defs.items():
+            if scope in gone_progs or (scope == "<controller>" and "Tags" in skipped) or \
+                    (scope != "<controller>" and "Programas" in skipped):
+                continue
+            by_scope[i][scope][name] = d
+    for scope in sorted(set(by_scope[0]) | set(by_scope[1]), key=lambda s: (s != "<controller>", s.lower())):
+        _cmp_entities(out, "Tags", by_scope[0].get(scope, {}), by_scope[1].get(scope, {}),
+                      prog=CTRL_SCOPE if scope == "<controller>" else scope, ignore=ignore)
+
+    if "AOIs" not in skipped:
+        for name in sorted(set(a.aois) | set(b.aois), key=str.lower):
+            owner, xa, xb = f"AOI {name}", a.aois.get(name), b.aois.get(name)
+            if xa is None or xb is None:
+                x = xb or xa
+                nrout = sum(1 for (o, _r) in (b if xa is None else a).routines if o == owner)
+                out.append(_change("Agregado" if xa is None else "Eliminado", "AOIs", owner, item=name,
+                                   detail=f"{len(x['params'])} parámetros, {nrout} rutinas", mode="props",
+                                   props=_props_table(None if xa is None else x["attrs"],
+                                                      x["attrs"] if xa is None else None)))
+                continue
+            rows = _props_table(xa["attrs"], xb["attrs"])
+            if any(r[3] for r in rows):
+                out.append(_change("Modificado", "AOIs", owner, item=name, detail=_changes_summary(rows),
+                                   mode="props", props=rows))
+            _cmp_entities(out, "AOIs", xa["params"], xb["params"], owner, label=lambda n: f"Parámetro {n}")
+            _cmp_entities(out, "AOIs", xa["locals"], xb["locals"], owner, label=lambda n: f"Tag local {n}")
+            ra = [r for (o, r) in a.routines if o == owner]
+            rb = [r for (o, r) in b.routines if o == owner]
+            _cmp_routines(out, owner, a, b, ra, rb)
+
+    if "UDTs" not in skipped:
+        for name in sorted(set(a.udts) | set(b.udts), key=str.lower):
+            ua, ub = a.udts.get(name), b.udts.get(name)
+            if ua is None or ub is None:
+                u = ub or ua
+                out.append(_change("Agregado" if ua is None else "Eliminado", "UDTs", item=name,
+                                   detail=f"{len(u['members'])} miembros: " + _short(", ".join(u["members"]), 100),
+                                   mode="props", props=_props_table(None if ua is None else u["attrs"],
+                                                                    u["attrs"] if ua is None else None)))
+                continue
+            rows = _props_table(ua["attrs"], ub["attrs"])
+            if any(r[3] for r in rows):
+                out.append(_change("Modificado", "UDTs", item=name, detail=_changes_summary(rows),
+                                   mode="props", props=rows))
+            _cmp_entities(out, "UDTs", ua["members"], ub["members"], label=lambda n, u=name: f"{u}.{n}")
+
+    if "Módulos" not in skipped:
+        _cmp_entities(out, "Módulos", a.modules, b.modules)
+
+    out.sort(key=lambda c: (CMP_CATS.index(c["cat"]), c["prog"] != CTRL_SCOPE, c["prog"].lower(),
+                            c["rout"].lower(), c["key"], c["item"].lower()))
+    return CompareResult(a, b, out, warnings, time.perf_counter() - t0, ignore_values)
+
+
+def compare_files(base_path, new_path, ignore_values=True):
+    return compare_projects(load_project(base_path), load_project(new_path), ignore_values)
+
+
+def diff_rows(ch, limit=3000):
+    """Filas para ver Base y Nuevo lado a lado. Cada fila es (izq, der); cada lado es
+    (numero, [(texto, etiqueta)], estilo) o None cuando esa linea no existe de ese lado.
+    Etiquetas de segmento: None, 'del', 'ins'. Estilos de fila: None, 'del', 'ins', 'chg'."""
+    if ch["mode"] == "tokens":
+        ta, tb = rung_tokens(ch["base"]), rung_tokens(ch["new"])
+        if not ta or not tb:
+            return [((None, [(ch["base"], "del")], "del"), None)] if ta else \
+                   [(None, (None, [(ch["new"], "ins")], "ins"))]
+        sm = difflib.SequenceMatcher(None, [_rkey(t) for t in ta], [_rkey(t) for t in tb], autojunk=False)
+        left, right = [], []
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            left += [(t, None if op == "equal" else "del") for t in ta[i1:i2]]
+            right += [(t, None if op == "equal" else "ins") for t in tb[j1:j2]]
+        return [((None, left, "chg"), (None, right, "chg"))]
+    if ch["mode"] != "lines":
+        return []
+    A, B = ch["base"] or [], ch["new"] or []
+    sm = difflib.SequenceMatcher(None, [_norm_ws(t) for _, t in A], [_norm_ws(t) for _, t in B],
+                                 autojunk=False)
+    rows = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            rows += [((na, [(ta, None)], None), (nb, [(tb, None)], None))
+                     for (na, ta), (nb, tb) in zip(A[i1:i2], B[j1:j2])]
+            continue
+        la, lb = A[i1:i2], B[j1:j2]
+        for k in range(max(len(la), len(lb))):
+            x = la[k] if k < len(la) else None
+            y = lb[k] if k < len(lb) else None
+            if x and y:
+                wa, wb = _WORD_RE.findall(x[1]), _WORD_RE.findall(y[1])
+                s2 = difflib.SequenceMatcher(None, wa, wb, autojunk=False)
+                sa, sb = [], []
+                for op2, a1, a2, b1, b2 in s2.get_opcodes():
+                    if a2 > a1:
+                        sa.append(("".join(wa[a1:a2]), None if op2 == "equal" else "del"))
+                    if b2 > b1:
+                        sb.append(("".join(wb[b1:b2]), None if op2 == "equal" else "ins"))
+                rows.append(((x[0], sa, "chg"), (y[0], sb, "chg")))
+            else:
+                rows.append(((x[0], [(x[1], None)], "del") if x else None,
+                             (y[0], [(y[1], None)], "ins") if y else None))
+        if len(rows) > limit:
+            break
+    return rows[:limit]
+
+
+_CMP_CSS = """
+.kAgregado{--c:#16a34a}.kEliminado{--c:var(--alta)}.kModificado{--c:var(--media)}
+.chip{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700;color:#fff;background:var(--c)}
+.sbs{width:100%;border-collapse:collapse;border:1px solid var(--border);margin-top:6px;table-layout:fixed;
+font:12px/1.45 Consolas,"Cascadia Mono",monospace}
+.sbs td{border:0;padding:1px 6px;white-space:pre-wrap;word-break:break-all}
+.sbs td.n{width:42px;color:var(--muted);text-align:right;user-select:none}
+.sbs th{font-size:11px}
+.del{background:rgba(220,38,38,.28)}.ins{background:rgba(22,163,74,.28)}
+.rdel{background:rgba(220,38,38,.08)}.rins{background:rgba(22,163,74,.08)}.rchg{background:rgba(217,119,6,.07)}
+.pad{background:repeating-linear-gradient(45deg,transparent 0 5px,rgba(127,127,127,.10) 5px 10px)}
+.props{margin-top:6px}.props tr.chg td{background:rgba(217,119,6,.13)}
+.warn{border-left:4px solid var(--media);background:var(--card);padding:10px 16px;border-radius:8px;margin:14px 0}
+.warn li{margin:2px 0}.bar select{padding:7px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text)}
+"""
+
+_CMP_JS = """
+const q=document.getElementById('q'),cat=document.getElementById('cat'),rows=[...document.querySelectorAll('#chg > tbody > tr')];
+function f(){const s=q.value.toLowerCase(),on=[...document.querySelectorAll('.kd:checked')].map(e=>e.value),c=cat.value;
+let n=0;rows.forEach(r=>{const ok=on.includes(r.dataset.kind)&&(!c||r.dataset.cat===c)&&(!s||r.textContent.toLowerCase().includes(s));
+r.style.display=ok?'':'none';if(ok)n++});document.getElementById('cnt').textContent=n+' visibles'}
+[q,cat].forEach(e=>e.addEventListener('input',f));document.querySelectorAll('.kd').forEach(e=>e.addEventListener('change',f));f();
+"""
+
+
+def _html_diff(ch):
+    e = html.escape
+    if ch["mode"] == "props":
+        out = ["<table class='props'><thead><tr><th>Propiedad</th><th>Base</th><th>Nuevo</th></tr></thead><tbody>"]
+        for k, va, vb, changed in ch["props"]:
+            out.append(f"<tr class='{'chg' if changed else ''}'><td>{e(prop_label(k))}</td>"
+                       f"<td>{e('' if va is None else str(va))}</td><td>{e('' if vb is None else str(vb))}</td></tr>")
+        return "".join(out) + "</tbody></table>"
+    rows = diff_rows(ch, limit=600)
+    if not rows:
+        return ""
+
+    def side(s):
+        if s is None:
+            return "<td class='n'></td><td class='pad'></td>"
+        num, segs, style = s
+        body = "".join(f"<span class='{tag}'>{e(t)}</span>" if tag else e(t) for t, tag in segs)
+        return f"<td class='n'>{'' if num is None else e(str(num))}</td><td class='r{style or ''}'>{body}</td>"
+    out = ["<table class='sbs'><colgroup><col style='width:42px'><col><col style='width:42px'><col></colgroup>"
+           "<thead><tr><th></th><th>Base</th><th></th><th>Nuevo</th></tr></thead><tbody>"]
+    out += [f"<tr>{side(l)}{side(r)}</tr>" for l, r in rows]
+    return "".join(out) + "</tbody></table>"
+
+
+def export_compare_html(dest, res, changes=None):
+    e = html.escape
+    changes = res.changes if changes is None else changes
+    cnt = Counter(c["kind"] for c in changes)
+    by_cat = {cat: Counter() for cat in CMP_CATS}
+    for c in changes:
+        by_cat[c["cat"]][c["kind"]] += 1
+    out = [f"<!doctype html><html lang='es'><head><meta charset='utf-8'>"
+           f"<meta name='viewport' content='width=device-width,initial-scale=1'><meta name='author' content='{e(__author__)}'>"
+           f"<title>Comparación L5X</title><style>{_HTML_CSS}{_CMP_CSS}</style></head><body><div class='wrap'>",
+           f"<header><div class='logo'>L5X</div><div><h1>Comparación de proyectos L5X</h1>"
+           f"<div class='muted'>Generado {datetime.now():%Y-%m-%d %H:%M} &middot; {APP_NAME} {__version__}"
+           f"{' &middot; valores de tags ignorados' if res.ignore_values else ''}</div></div></header>",
+           "<table><thead><tr><th></th><th>Archivo</th><th>Controlador</th><th>Procesador</th><th>Firmware</th>"
+           "<th>Exportado</th></tr></thead><tbody>"]
+    for role, p in (("Base", res.base), ("Nuevo", res.new)):
+        ca = p.ctrl_attrs
+        out.append(f"<tr><td><b>{role}</b></td><td>{e(os.path.basename(p.path))}</td><td>{e(ca.get('Name', '-'))}</td>"
+                   f"<td>{e(ca.get('ProcessorType', '-'))}</td><td>{e(ca.get('Firmware', '-'))}</td>"
+                   f"<td>{e(p.info.get('ExportDate', '-'))}</td></tr>")
+    out.append("</tbody></table><div class='kpis' style='margin-top:16px'>")
+    for k, var in (("Agregado", "#16a34a"), ("Eliminado", "var(--alta)"), ("Modificado", "var(--media)")):
+        out.append(f"<div class='kpi' style='--c:{var}'><div class='l'>{k}s</div><div class='v'>{cnt[k]}</div></div>")
+    out.append(f"<div class='kpi'><div class='l'>Total de cambios</div><div class='v'>{len(changes)}</div></div></div>")
+    if res.warnings:
+        out.append("<div class='warn'><b>Avisos</b><ul>" + "".join(f"<li>{e(w)}</li>" for w in res.warnings)
+                   + "</ul></div>")
+    out.append("<h2>Cambios por categoría</h2><table><thead><tr><th>Categoría</th><th class='num'>Agregados</th>"
+               "<th class='num'>Eliminados</th><th class='num'>Modificados</th></tr></thead><tbody>")
+    for cat in CMP_CATS:
+        c = by_cat[cat]
+        if sum(c.values()):
+            out.append(f"<tr><td>{e(cat)}</td><td class='num'>{c['Agregado']}</td><td class='num'>{c['Eliminado']}</td>"
+                       f"<td class='num'>{c['Modificado']}</td></tr>")
+    out.append("</tbody></table><h2>Detalle</h2><div class='bar'><input id='q' placeholder='Buscar programa, rutina, "
+               "tag, texto...'><select id='cat'><option value=''>Todas las categorías</option>")
+    out += [f"<option>{e(c)}</option>" for c in CMP_CATS if sum(by_cat[c].values())]
+    out.append("</select>")
+    out += [f"<label><input type='checkbox' class='kd' value='{k}' checked> {k}s</label>" for k in CMP_KINDS]
+    out.append("<span id='cnt' class='muted'></span></div><table id='chg'><thead><tr><th>Cambio</th><th>Categoría</th>"
+               "<th>Ubicación</th><th>Elemento</th><th>Detalle</th></tr></thead><tbody>")
+    for c in changes:
+        where = " / ".join(x for x in (c["prog"], c["rout"]) if x != "-") or "-"
+        diff = _html_diff(c)
+        body = e(c["detail"]) + (f"<details><summary>Ver diferencias</summary>{diff}</details>" if diff else "")
+        out.append(f"<tr data-kind='{c['kind']}' data-cat='{e(c['cat'])}'><td><span class='chip k{c['kind']}'>"
+                   f"{c['kind']}</span></td><td>{e(c['cat'])}</td><td>{e(where)}</td>"
+                   f"<td><b>{e(c['item'])}</b>{('<br><span class=muted>' + e(c['loc']) + '</span>') if c['loc'] else ''}"
+                   f"</td><td>{body}</td></tr>")
+    out.append(f"</tbody></table><p class='note'>{APP_NAME} {__version__} &middot; {e(APP_CREDIT)} &middot; "
+               f"{e(APP_COPYRIGHT)}</p></div><script>{_CMP_JS}</script></body></html>")
+    with open(dest, "w", encoding="utf-8") as fh:
+        fh.write("".join(out))
+
+
+def _flat(v, n=2000):
+    s = "" if v is None else (v if isinstance(v, str) else "\n".join(str(t) for _, t in v))
+    return s if len(s) <= n else s[:n] + " ..."
+
+
+def export_compare_xlsx(dest, res, changes=None):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    changes = res.changes if changes is None else changes
+    fills = {"Agregado": "DCFCE7", "Eliminado": "FDE2E2", "Modificado": "FEF3C7"}
+    head_fill, head_font = PatternFill("solid", fgColor="1F2937"), Font(bold=True, color="FFFFFF")
+
+    def header(ws, row, values):
+        for c, v in enumerate(values, 1):
+            cell = ws.cell(row=row, column=c, value=v)
+            cell.fill, cell.font = head_fill, head_font
+
+    wb = Workbook()
+    wb.properties.creator = __author__
+    wb.properties.title = f"{APP_NAME} - comparación"
+    ws = wb.active
+    ws.title = "Resumen"
+    ws.append([f"{APP_NAME} {__version__} - comparación de proyectos"])
+    ws["A1"].font = Font(bold=True, size=14)
+    ws.append([f"Generado: {datetime.now():%Y-%m-%d %H:%M}   ·   {APP_CREDIT}" +
+               ("   ·   valores de tags ignorados" if res.ignore_values else "")])
+    ws.append([])
+    header(ws, 4, ["", "Archivo", "Controlador", "Procesador", "Firmware", "Exportado"])
+    for role, p in (("Base", res.base), ("Nuevo", res.new)):
+        ca = p.ctrl_attrs
+        ws.append([role, os.path.basename(p.path), ca.get("Name", ""), ca.get("ProcessorType", ""),
+                   ca.get("Firmware", ""), p.info.get("ExportDate", "")])
+    ws.append([])
+    header(ws, ws.max_row + 1, ["Categoría", "Agregados", "Eliminados", "Modificados", "Total"])
+    by_cat = {cat: Counter() for cat in CMP_CATS}
+    for c in changes:
+        by_cat[c["cat"]][c["kind"]] += 1
+    for cat in CMP_CATS:
+        c = by_cat[cat]
+        ws.append([cat, c["Agregado"], c["Eliminado"], c["Modificado"], sum(c.values())])
+    tot = Counter(c["kind"] for c in changes)
+    ws.append(["TOTAL", tot["Agregado"], tot["Eliminado"], tot["Modificado"], len(changes)])
+    ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+    for i, w in enumerate((14, 34, 20, 16, 12, 28), 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws2 = wb.create_sheet("Cambios")
+    cols = ["Cambio", "Categoría", "Programa / elemento", "Rutina", "Elemento", "Ubicación", "Detalle", "Base", "Nuevo"]
+    header(ws2, 1, cols)
+    for c in changes:
+        if c["mode"] == "props":
+            base = "\n".join(f"{prop_label(k)}: {va}" for k, va, vb, ch in c["props"] if va is not None and
+                             (ch or c["kind"] != "Modificado"))
+            new = "\n".join(f"{prop_label(k)}: {vb}" for k, va, vb, ch in c["props"] if vb is not None and
+                            (ch or c["kind"] != "Modificado"))
+        else:
+            base, new = _flat(c["base"]), _flat(c["new"])
+        ws2.append([c["kind"], c["cat"], c["prog"], c["rout"], c["item"], c["loc"], c["detail"], base, new])
+        ws2.cell(row=ws2.max_row, column=1).fill = PatternFill("solid", fgColor=fills[c["kind"]])
+    for i, w in enumerate((12, 13, 22, 20, 26, 20, 60, 50, 50), 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+    for row in ws2.iter_rows(min_row=2):
+        for cell in row[6:9]:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws2.freeze_panes = "A2"
+    ws2.auto_filter.ref = ws2.dimensions
+
+    if res.warnings:
+        ws3 = wb.create_sheet("Avisos")
+        header(ws3, 1, ["Aviso"])
+        for w in res.warnings:
+            ws3.append([w])
+        ws3.column_dimensions["A"].width = 120
+    wb.save(dest)
+
+
+CMP_EXPORTERS = {"html": export_compare_html, "xlsx": export_compare_xlsx}
+
+
 # ------------------------------------------------------------ proyecto demo --
 DEMO_L5X = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <RSLogix5000Content SchemaRevision="1.0" SoftwareRevision="33.01" TargetName="DEMO_Linea3"
@@ -1011,6 +1875,33 @@ DEMO_L5X = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 """
 
 
+def write_demo_compare(folder=None):
+    """Genera el demo y una segunda version con cambios conocidos para probar el comparador."""
+    folder = folder or tempfile.gettempdir()
+    base = write_demo(folder)
+    root = ET.fromstring(DEMO_L5X.encode("utf-8"))
+    root.set("ExportDate", "Mon Oct 12 09:00:00 2026")
+    ctrl = root.find("Controller")
+    ctrl.set("MinorRev", "12")
+    ET.SubElement(ctrl.find("Tags"), "Tag", Name="Permiso_Calidad", TagType="Base", DataType="BOOL",
+                  Radix="Decimal")
+    seg = root.find(".//Routine[@Name='Seguridad']/RLLContent").findall("Rung")
+    seg[0].find("Comment").text = "Guarda de puerta (puente retirado)"
+    seg[0].find("Text").text = "XIC(Puerta_Cerrada)XIC(Paro_Emergencia_OK)OTE(Permiso_Marcha);"
+    seg[1].find("Text").text = "XIC(Sensor_Pieza)OTE(Pieza_Presente);"
+    insp = root.find(".//Routine[@Name='Inspeccion']/RLLContent")
+    rung = ET.Element("Rung", Number="1", Type="N")
+    ET.SubElement(rung, "Text").text = "XIC(Camara_Lista)XIC(Permiso_Calidad)OTE(Rechazo_Habilitado);"
+    insp.insert(1, rung)
+    for i, r in enumerate(insp.findall("Rung")):
+        r.set("Number", str(i))
+    routs = root.find(".//Program[@Name='Estacion10']/Routines")
+    routs.remove(routs.find("Routine[@Name='Rutina_Vieja']"))
+    path = os.path.join(folder, "DEMO_Linea3_v2.L5X")
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+    return base, path
+
+
 def write_demo(folder=None):
     folder = folder or tempfile.gettempdir()
     path = os.path.join(folder, "DEMO_Linea3.L5X")
@@ -1067,6 +1958,33 @@ def save_reviews(path, statuses):
 
 
 # ------------------------------------------------------------------ CLI ------
+def cli_compare(a):
+    base, new = a.compare
+    print(f"Comparando\n  Base:  {base}\n  Nuevo: {new}")
+    try:
+        res = compare_files(base, new, ignore_values=not a.incluir_valores)
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    for w in res.warnings:
+        print(f"  AVISO: {w}")
+    print(f"\n  {'Categoría':<13}{'Agreg.':>8}{'Elim.':>8}{'Modif.':>8}")
+    for cat, c in res.by_cat.items():
+        if sum(c.values()):
+            print(f"  {cat:<13}{c['Agregado']:>8}{c['Eliminado']:>8}{c['Modificado']:>8}")
+    cnt = res.counts
+    print(f"  {'TOTAL':<13}{cnt['Agregado']:>8}{cnt['Eliminado']:>8}{cnt['Modificado']:>8}\n")
+    for c in res.changes:
+        where = "/".join(x for x in (c["prog"], c["rout"]) if x != "-")
+        print(f"  {c['kind']:<10} {c['cat']:<12} {where[:30]:<30} {c['item'][:28]:<28} {c['detail'][:70]}")
+    for kind in ("html", "xlsx"):
+        dest = getattr(a, kind)
+        if dest:
+            CMP_EXPORTERS[kind](dest, res)
+            print(f"\nReporte {kind.upper()} generado: {dest}")
+    return 0
+
+
 def cli(argv):
     ap = argparse.ArgumentParser(
         prog="l5x_auditor", description=f"{APP_NAME} {__version__}: auditoría estática de archivos L5X.")
@@ -1085,9 +2003,15 @@ def cli(argv):
     ap.add_argument("--list-rules", action="store_true", help="listar reglas y salir")
     ap.add_argument("--demo", action="store_true", help="analizar el proyecto de demostración")
     ap.add_argument("--gui", action="store_true", help="abrir la interfaz grafica")
+    ap.add_argument("--compare", nargs=2, metavar=("BASE", "NUEVO"),
+                    help="comparar dos L5X (usa --html / --xlsx para el reporte)")
+    ap.add_argument("--incluir-valores", action="store_true",
+                    help="al comparar, reportar tambien cambios que solo son de valor de tags")
     ap.add_argument("--version", action="version", version=f"{APP_NAME} {__version__} - {APP_CREDIT}")
     a = ap.parse_args(argv)
 
+    if a.compare:
+        return cli_compare(a)
     if a.list_rules:
         for r in sorted(RULES.values(), key=lambda r: (SEVERITY_ORDER[r.sev], r.code)):
             print(f"{r.sev:6} {r.code:24} {r.title}")
@@ -1360,12 +2284,13 @@ class Logo(_CanvasBase):
 
 class AuditorApp:
     NAV = (("panel", "Panel", "▦"), ("hallazgos", "Hallazgos", "⚠"),
-           ("proyecto", "Proyecto", "☰"), ("reglas", "Reglas", "✔"),
+           ("proyecto", "Proyecto", "☰"), ("comparar", "Comparar", "⇄"), ("reglas", "Reglas", "✔"),
            ("registro", "Registro", "≡"))
     TITLES = {
         "panel": ("Panel", "Resumen del análisis y del riesgo de cada proyecto"),
         "hallazgos": ("Hallazgos", "Filtra, revisa y clasifica cada hallazgo"),
         "proyecto": ("Proyecto", "Estructura del controlador, programas y uso de instrucciones"),
+        "comparar": ("Comparar", "Diferencias entre una versión Base y una Nueva del proyecto"),
         "reglas": ("Reglas", "Activa o desactiva las reglas de análisis"),
         "registro": ("Registro", "Bitácora de la sesión"),
     }
@@ -1387,6 +2312,11 @@ class AuditorApp:
         self.proj_idx = 0
         self.only_view = tk.BooleanVar(root, value=self.cfg.get("export_only_view", False))
         self._toast = None
+        base = self.cfg.get("cmp_base")
+        self.cmp = {"base": base if base and os.path.isfile(base) else None, "new": None, "result": None,
+                    "flt": {"kinds": set(CMP_KINDS), "cat": 0, "prog": 0, "rout": 0, "q": ""},
+                    "current": None, "view": [], "gen": 0,
+                    "ignore_values": self.cfg.get("cmp_ignore_values", True)}
 
         root.title(APP_TITLE)
         root.geometry(self.cfg.get("geometry", "1320x820"))
@@ -1397,8 +2327,8 @@ class AuditorApp:
         self.log(f"{APP_NAME} {__version__} listo.")
         self.log("Exporta desde Studio 5000: File > Save As > Logix Designer XML File (*.L5X)")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        for seq, fn in (("<Control-o>", self.choose_files), ("<F5>", self.analyze),
-                        ("<Control-f>", self.focus_search), ("<Control-e>", lambda: self.export("html")),
+        for seq, fn in (("<Control-o>", self.choose_files), ("<F5>", self.run_current),
+                        ("<Control-f>", self.focus_search), ("<Control-e>", self.export_current),
                         ("<F1>", self.about)):
             root.bind(seq, lambda e, fn=fn: fn())
         if dnd:
@@ -1486,6 +2416,7 @@ class AuditorApp:
         self._build_findings_page(self.pages["hallazgos"])
         self._build_rules_page(self.pages["reglas"])
         self._build_log_page(self.pages["registro"])
+        self._build_compare_page(self.pages["comparar"])
         self.refresh_all()
         self.show(self.page)
 
@@ -1581,6 +2512,7 @@ class AuditorApp:
                                     activestyle="none", font=F["small"], selectmode="extended")
         self.files_box.pack(fill="both", expand=True)
         self.files_box.bind("<Delete>", lambda e: self.remove_selected())
+        self.files_box.bind("<Button-3>", self._files_menu)
         self.files_hint = tk.Label(box, bg=P["sidebar"], fg=P["faint"], font=F["small"], justify="left",
                                    wraplength=190, anchor="w")
 
@@ -1703,11 +2635,16 @@ class AuditorApp:
             if not badge.cget("text"):
                 badge.configure(bg=bg, fg=bg)
         self.pages[key].tkraise()
+        self._sync_export_btn()
         title, sub = self.TITLES[key]
         self.title_lbl.configure(text=title)
         self.sub_lbl.configure(text=sub)
 
     def focus_search(self):
+        if self.page == "comparar" and getattr(self, "cmp_search", None) is not None \
+                and self.cmp_search.winfo_exists():
+            self.cmp_search.focus_set()
+            return
         self.show("hallazgos")
         self.search.focus_set()
 
@@ -1731,6 +2668,8 @@ class AuditorApp:
         P = self.P
         items = {"hallazgos": (cnt["ALTA"], "ALTA") if cnt["ALTA"] else (len(self.findings), "INFO")}
         items["reglas"] = (len(RULES) - len(self.enabled), "MEDIA")
+        if self.cmp["result"] is not None:
+            items["comparar"] = (len(self.cmp["result"].changes), "INFO")
         for key, (_row, _bar, _ic, _lb, badge) in self.nav.items():
             n, sev = items.get(key, (0, "INFO"))
             if n:
@@ -1760,6 +2699,8 @@ class AuditorApp:
                 added += 1
                 self.log(f"Archivo agregado: {p}")
         if added:
+            if self.cmp["new"] is None:
+                self.cmp["new"] = next((f for f in self.files if f != self.cmp["base"]), None)
             self.refresh_files()
             self.render_panel()
             if not quiet:
@@ -1802,7 +2743,8 @@ class AuditorApp:
         else:
             self.files_hint.place_forget()
         self.btn_analyze.set_enabled(bool(self.files) and not self.busy)
-        self.btn_export.set_enabled(bool(self.results) and not self.busy)
+        self._sync_export_btn()
+        self.refresh_cmp_slots()
 
     # ------------------------------------------------------------- analisis --
     def analyze(self):
@@ -1815,6 +2757,7 @@ class AuditorApp:
         self.results, self.findings, self.current = [], [], None
         self.btn_analyze.set_enabled(False)
         self.btn_export.set_enabled(False)
+        self.refresh_cmp_slots()
         self.progress.configure(maximum=len(self.files), value=0)
         self.progress.pack(side="right", padx=10)
         self.set_status("Analizando...", "MEDIA")
@@ -1845,6 +2788,13 @@ class AuditorApp:
                     self.toast(f"No se pudo leer {os.path.basename(msg[1])}:\n{msg[2]}", "ALTA", 6000)
                 elif kind == "done":
                     self._finish()
+                elif kind == "cmp_progress":
+                    self.progress.configure(value=msg[1])
+                    self.set_status(msg[2], "MEDIA")
+                elif kind == "cmp_done":
+                    self._cmp_finish(msg[1])
+                elif kind == "cmp_error":
+                    self._cmp_failed(msg[1])
         except queue.Empty:
             pass
         self.root.after(60, self._poll)
@@ -2501,7 +3451,624 @@ class AuditorApp:
         self.log_txt.configure(state="disabled")
 
     # --------------------------------------------------------- exportacion --
+    # ------------------------------------------------------------ comparar --
+    KIND_COLORS = {"Agregado": "ok", "Eliminado": "ALTA", "Modificado": "MEDIA"}
+
+    def run_current(self):
+        self.compare() if self.page == "comparar" else self.analyze()
+
+    def export_current(self):
+        if self.page == "comparar":
+            self.export_compare("html")
+        else:
+            self.export("html")
+
+    def _files_menu(self, e):
+        i = self.files_box.nearest(e.y)
+        if not 0 <= i < len(self.files):
+            return
+        path = self.files[i]
+
+        def remove():
+            self.files_box.selection_clear(0, "end")
+            self.files_box.selection_set(i)
+            self.remove_selected()
+        m = self.menu()
+        m.add_command(label="Usar como Base para comparar", command=lambda: self.set_cmp_file("base", path))
+        m.add_command(label="Usar como Nuevo para comparar", command=lambda: self.set_cmp_file("new", path))
+        m.add_separator()
+        m.add_command(label="Quitar de la lista", command=remove)
+        m.tk_popup(e.x_root, e.y_root)
+
+    def set_cmp_file(self, which, path, show=True):
+        self.cmp[which] = os.path.abspath(path)
+        self.refresh_cmp_slots()
+        if show:
+            self.show("comparar")
+
+    def choose_cmp_file(self, which):
+        if self.busy:
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Selecciona el L5X " + ("Base (versión anterior)" if which == "base" else "Nuevo"),
+            initialdir=os.path.dirname(self.cmp[which]) if self.cmp[which] else (self.cfg.get("last_dir") or None),
+            filetypes=[("Proyectos Logix (L5X)", "*.L5X *.l5x"), ("Todos los archivos", "*.*")])
+        if path:
+            self.cfg["last_dir"] = os.path.dirname(path)
+            self.set_cmp_file(which, path, show=False)
+
+    def _cmp_from_audit_menu(self, which, widget):
+        m = self.menu()
+        if not self.files:
+            m.add_command(label="No hay archivos cargados en la auditoría", state="disabled")
+        for f in self.files:
+            m.add_command(label=os.path.basename(f), command=lambda f=f: self.set_cmp_file(which, f, show=False))
+        m.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height() + 2)
+
+    def swap_cmp(self):
+        self.cmp["base"], self.cmp["new"] = self.cmp["new"], self.cmp["base"]
+        self.refresh_cmp_slots()
+
+    def load_cmp_demo(self):
+        base, new = write_demo_compare()
+        self.cmp["base"], self.cmp["new"] = base, new
+        self.refresh_cmp_slots()
+        self.compare()
+
+    def _build_compare_page(self, pg):
+        P = self.P
+        if self.cmp["new"] is None:
+            self.cmp["new"] = next((f for f in self.files if f != self.cmp["base"]), None)
+        top_o, top = self.card(pg, pad=14)
+        top_o.pack(fill="x")
+        top.columnconfigure(0, weight=1, uniform="slot")
+        top.columnconfigure(2, weight=1, uniform="slot")
+        self.cmp_slots = {}
+        for col, which, title in ((0, "base", "BASE  ·  versión anterior"), (2, "new", "NUEVO  ·  versión a revisar")):
+            slot = tk.Frame(top, bg=P["surface"], highlightthickness=1, highlightbackground=P["border"])
+            slot.grid(row=0, column=col, sticky="nsew")
+            inner = tk.Frame(slot, bg=P["surface"])
+            inner.pack(fill="both", expand=True, padx=14, pady=10)
+            self.label(inner, title, "caps", "faint", "surface").pack(anchor="w")
+            name = self.label(inner, "", "h2", "text", "surface", anchor="w")
+            name.pack(anchor="w", fill="x", pady=(2, 0))
+            info = self.label(inner, "", "small", "muted", "surface", anchor="w")
+            info.pack(anchor="w", fill="x")
+            btns = tk.Frame(inner, bg=P["surface"])
+            btns.pack(anchor="w", pady=(8, 0))
+            FlatButton(btns, self, "Elegir archivo…", lambda w=which: self.choose_cmp_file(w), small=True).pack(
+                side="left")
+            fa = FlatButton(btns, self, "De la auditoría  ▾", None, small=True)
+            fa.command = lambda w=which, b=fa: self._cmp_from_audit_menu(w, b)
+            fa.pack(side="left", padx=(6, 0))
+            self.cmp_slots[which] = (name, info)
+        FlatButton(top, self, "⇄", self.swap_cmp, kind="ghost", bg=P["card"]).grid(row=0, column=1, padx=8)
+        acts = tk.Frame(top, bg=P["card"])
+        acts.grid(row=0, column=3, sticky="ns", padx=(14, 0))
+        self.btn_compare = FlatButton(acts, self, "▶  Comparar", self.compare, kind="primary")
+        self.btn_compare.pack(fill="x")
+        self.pill_values = Pill(acts, self, "Ignorar cambios solo de valor", P["accent"],
+                                self.cmp["ignore_values"], self._toggle_ignore_values)
+        self.pill_values.pack(fill="x", pady=(8, 0))
+        self.cmp_body = tk.Frame(pg, bg=P["bg"])
+        self.cmp_body.pack(fill="both", expand=True, pady=(12, 0))
+        self.cmp_search = None
+        self.refresh_cmp_slots()
+        self.render_compare()
+
+    def _toggle_ignore_values(self):
+        self.cmp["ignore_values"] = self.pill_values.active
+        self.cfg["cmp_ignore_values"] = self.pill_values.active
+        save_config(self.cfg)
+        if self.cmp["result"] is not None:
+            self.toast("Pulsa Comparar (F5) para aplicar el cambio.")
+
+    def refresh_cmp_slots(self):
+        if not getattr(self, "cmp_slots", None) or not self.btn_compare.winfo_exists():
+            return
+        res = self.cmp["result"]
+        known = {r.path: r.project for r in self.results}
+        if res is not None:
+            known.setdefault(res.base.path, res.base)
+            known.setdefault(res.new.path, res.new)
+        for which, (name, info) in self.cmp_slots.items():
+            path = self.cmp[which]
+            if not path:
+                name.configure(text="Sin archivo", fg=self.P["faint"])
+                info.configure(text="Elige un .L5X o toma uno de la auditoría")
+                continue
+            name.configure(text=os.path.basename(path), fg=self.P["text"])
+            proj = known.get(path)
+            if proj is not None:
+                ca = proj.ctrl_attrs
+                txt = f"{ca.get('Name', '?')}  ·  {ca.get('ProcessorType', '')}  ·  v{ca.get('Firmware', '?')}"
+                if proj.info.get("ExportDate"):
+                    txt += f"  ·  exportado {proj.info['ExportDate']}"
+            else:
+                txt = os.path.dirname(path)
+            info.configure(text=_short(txt, 90))
+        ready = bool(self.cmp["base"] and self.cmp["new"]) and not self.busy
+        self.btn_compare.set_enabled(ready)
+
+    # --- ejecucion ---
+    def compare(self):
+        if self.busy:
+            return
+        b, n = self.cmp["base"], self.cmp["new"]
+        if not b or not n:
+            self.toast("Elige los archivos Base y Nuevo", "MEDIA")
+            self.show("comparar")
+            return
+        if os.path.abspath(b) == os.path.abspath(n):
+            self.toast("Base y Nuevo son el mismo archivo", "MEDIA")
+            return
+        self.busy = True
+        self.t0 = time.perf_counter()
+        self.show("comparar")
+        self.refresh_cmp_slots()
+        self.btn_analyze.set_enabled(False)
+        self.progress.configure(maximum=3, value=0)
+        self.progress.pack(side="right", padx=10)
+        cached = {r.path: r.project for r in self.results}
+        self.log(f"Comparando Base={b}  Nuevo={n}")
+        threading.Thread(target=self._cmp_worker, args=(b, n, self.cmp["ignore_values"], cached),
+                         daemon=True).start()
+
+    def _cmp_worker(self, b, n, ignore, cached):
+        try:
+            self.q.put(("cmp_progress", 0, f"Leyendo Base: {os.path.basename(b)}"))
+            pa = cached.get(b) or load_project(b)
+            self.q.put(("cmp_progress", 1, f"Leyendo Nuevo: {os.path.basename(n)}"))
+            pb = cached.get(n) or load_project(n)
+            self.q.put(("cmp_progress", 2, "Comparando..."))
+            self.q.put(("cmp_done", compare_projects(pa, pb, ignore)))
+        except Exception as exc:
+            self.q.put(("cmp_error", exc))
+
+    def _cmp_end_busy(self):
+        self.busy = False
+        self.progress.pack_forget()
+        self.refresh_files()
+        self.refresh_cmp_slots()
+
+    def _cmp_failed(self, exc):
+        self._cmp_end_busy()
+        self.log(f"ERROR al comparar: {exc}")
+        self.set_status("Error al comparar", "ALTA")
+        self.toast(f"No se pudo comparar:\n{exc}", "ALTA", 6000)
+
+    def _cmp_finish(self, res):
+        self.cmp.update(result=res, current=None, view=[])
+        self.cmp["flt"] = {"kinds": set(CMP_KINDS), "cat": 0, "prog": 0, "rout": 0, "q": ""}
+        self.cfg["cmp_base"] = res.base.path
+        save_config(self.cfg)
+        self._cmp_end_busy()
+        cnt = res.counts
+        dt = time.perf_counter() - self.t0
+        msg = (f"{len(res.changes)} cambios: {cnt['Agregado']} agregados, {cnt['Eliminado']} eliminados, "
+               f"{cnt['Modificado']} modificados ({dt:.1f}s)")
+        self.log("Comparación completa: " + msg)
+        for w in res.warnings:
+            self.log("  AVISO: " + w)
+        self.set_status("Comparación completa: " + msg, "ok")
+        self.render_compare()
+        self.refresh_badges()
+        self.toast("Comparación completa\n" + msg.split(" (")[0], "ok")
+
+    # --- vista ---
+    def render_compare(self):
+        body = self.cmp_body
+        for w in body.winfo_children():
+            w.destroy()
+        self.cmp_search = None
+        res = self.cmp["result"]
+        if res is None:
+            self._render_cmp_empty(body)
+            return
+        P = self.P
+        cnt = res.counts
+        kpis = tk.Frame(body, bg=P["bg"])
+        kpis.pack(fill="x")
+        items = [("AGREGADOS", cnt["Agregado"], "ok", {"Agregado"}),
+                 ("ELIMINADOS", cnt["Eliminado"], "ALTA", {"Eliminado"}),
+                 ("MODIFICADOS", cnt["Modificado"], "MEDIA", {"Modificado"}),
+                 ("TOTAL DE CAMBIOS", len(res.changes), "accent", set(CMP_KINDS))]
+        for i, (title, val, col, kinds) in enumerate(items):
+            outer = tk.Frame(kpis, bg=P["card"], highlightthickness=1, highlightbackground=P["border"], cursor="hand2")
+            outer.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 12, 0))
+            kpis.columnconfigure(i, weight=1, uniform="k")
+            tk.Frame(outer, bg=P[col], height=3).pack(fill="x")
+            inner = tk.Frame(outer, bg=P["card"], cursor="hand2")
+            inner.pack(fill="both", expand=True, padx=14, pady=(6, 6))
+            ws = [self.label(inner, f"{val:,}", "h1", col), self.label(inner, title, "caps", "muted")]
+            ws[0].pack(side="left")
+            ws[1].pack(side="left", padx=(10, 0), pady=(4, 0))
+            for w in [outer, inner] + ws:
+                w.configure(cursor="hand2")
+                w.bind("<ButtonRelease-1>", lambda e, k=kinds: self._cmp_set_filter(kinds=set(k), cat=0))
+
+        strip = tk.Frame(body, bg=P["bg"])
+        strip.pack(fill="x", pady=(8, 0))
+        self.cmp_count = self.label(strip, "", "small", "muted", "bg")
+        self.cmp_count.pack(side="right")
+        cats = self._cmp_cats()
+        for cat, c in res.by_cat.items():
+            n = sum(c.values())
+            if not n:
+                continue
+            chip = tk.Label(strip, text=f"{cat} {n}", font=self.F["small_b"], bg=P["card"], fg=P["text"],
+                            padx=7, pady=2, cursor="hand2", highlightthickness=1, highlightbackground=P["border"])
+            chip.pack(side="left", padx=2)
+            chip.bind("<ButtonRelease-1>", lambda e, cat=cat: self._cmp_set_filter(cat=cats.index(cat) + 1))
+
+        if res.warnings:
+            wo = tk.Frame(body, bg=P["card"], highlightthickness=1, highlightbackground=P["border"])
+            wo.pack(fill="x", pady=(10, 0))
+            tk.Frame(wo, bg=P["MEDIA"], width=4).pack(side="left", fill="y")
+            wi = tk.Frame(wo, bg=P["card"])
+            wi.pack(side="left", fill="x", expand=True, padx=12, pady=5)
+            shown = res.warnings[:2]
+            more = len(res.warnings) - len(shown)
+            text = "\n".join("⚠  " + w for w in shown) + (f"\n… y {more} aviso(s) más en Registro" if more else "")
+            self.label(wi, text, "small", "text", justify="left", anchor="w", wraplength=1100).pack(anchor="w")
+
+        if not res.changes:
+            o, c = self.card(body, pad=30)
+            o.pack(fill="both", expand=True, pady=(12, 0))
+            self.label(c, "✔  No hay diferencias", "h1", "ok").pack(pady=(20, 6))
+            self.label(c, "Los dos proyectos son equivalentes (se ignoraron fechas, orden de atributos y espacios"
+                          + (" y valores de tags" if res.ignore_values else "") + ").", "body", "muted").pack()
+            return
+        self._build_cmp_filters(body)
+        pane = ttk.Panedwindow(body, orient="vertical")
+        pane.pack(fill="both", expand=True)
+        to, tb = self.card(pane, pad=1)
+        cols = ("kind", "cat", "prog", "rout", "item", "loc", "detail")
+        wrap, self.cmp_tv = self.tree(tb, cols, ("Cambio", "Categoría", "Programa / elemento", "Rutina", "Elemento",
+                                                 "Ubicación", "Detalle"),
+                                      (104, 108, 160, 140, 190, 140, 420), height=6, stretch="detail")
+        wrap.pack(fill="both", expand=True)
+        for k, col in self.KIND_COLORS.items():
+            self.cmp_tv.tag_configure(k, background=blend(P[col], P["card"], 0.08))
+        self.cmp_tv.bind("<<TreeviewSelect>>", lambda e: self._cmp_on_select())
+        pane.add(to, weight=3)
+        do, db = self.card(pane, pad=14)
+        pane.add(do, weight=3)
+        self._build_cmp_detail(db)
+        self.root.after(200, lambda: pane.winfo_exists() and pane.sashpos(0, max(int(pane.winfo_height() * 0.40), 140)))
+        self.refresh_cmp_filters()
+        self.refresh_cmp_tree()
+
+    def _render_cmp_empty(self, body):
+        P = self.P
+        wrap = tk.Frame(body, bg=P["bg"])
+        wrap.place(relx=0.5, rely=0.42, anchor="center")
+        o, c = self.card(wrap, pad=32)
+        o.pack()
+        self.label(c, "⇄", "kpi", "accent").pack()
+        self.label(c, "Compara dos versiones del proyecto", "h1").pack(pady=(6, 4))
+        self.label(c, "Elige la versión anterior como Base y la versión a revisar como Nuevo.\n"
+                      "La Base se recuerda: la próxima vez solo eliges el archivo nuevo.\n"
+                      "Clic derecho sobre un archivo de la lista lateral para usarlo aquí.",
+                   "body", "muted", justify="center").pack()
+        btns = tk.Frame(c, bg=P["card"])
+        btns.pack(pady=(18, 6))
+        FlatButton(btns, self, "▶  Comparar", self.compare, kind="primary").pack(side="left", padx=5)
+        FlatButton(btns, self, "Probar con ejemplo", self.load_cmp_demo).pack(side="left", padx=5)
+        self.label(c, "Detecta cambios en programas, rutinas (RLL, ST, FBD, SFC), rungs, comentarios, tags,\n"
+                      "AOIs, UDTs, módulos de E/S y propiedades del controlador.", "small", "faint",
+                   justify="center").pack(pady=(10, 0))
+
+    def _build_cmp_filters(self, body):
+        P = self.P
+        fo, fb = self.card(body, pad=10)
+        fo.pack(fill="x", pady=(8, 6))
+        self.cmp_search = SearchEntry(fb, self, "⌕  Buscar programa, rutina, tag, texto...  (Ctrl+F)",
+                                      self._cmp_filters_changed)
+        self.cmp_search.pack(side="left", fill="x", expand=True)
+        if self.cmp["flt"]["q"]:
+            self.cmp_search.set_value(self.cmp["flt"]["q"], notify=False)
+        pills = tk.Frame(fb, bg=P["card"])
+        pills.pack(side="left", padx=(10, 6))
+        self.cmp_pills = {}
+        for k in CMP_KINDS:
+            p = Pill(pills, self, k, P[self.KIND_COLORS[k]], k in self.cmp["flt"]["kinds"], self._cmp_filters_changed)
+            p.pack(side="left", padx=2)
+            self.cmp_pills[k] = p
+        self.cmp_cb_cat = ttk.Combobox(fb, state="readonly", width=15)
+        self.cmp_cb_prog = ttk.Combobox(fb, state="readonly", width=19)
+        self.cmp_cb_rout = ttk.Combobox(fb, state="readonly", width=15)
+        for cb in (self.cmp_cb_cat, self.cmp_cb_prog, self.cmp_cb_rout):
+            cb.pack(side="left", padx=3)
+            cb.bind("<<ComboboxSelected>>", lambda e, cb=cb: self._cmp_filters_changed(cb))
+
+    def _build_cmp_detail(self, db):
+        P, F = self.P, self.F
+        head = tk.Frame(db, bg=P["card"])
+        head.pack(fill="x")
+        self.cd_badge = tk.Label(head, font=F["caps"], padx=8, pady=2, bg=P["card"])
+        self.cd_badge.pack(side="left")
+        self.cd_title = self.label(head, "Selecciona un cambio para ver el detalle", "h2")
+        self.cd_title.pack(side="left", padx=10)
+        self.cd_loc = self.label(db, "", "small", "muted", anchor="w")
+        self.cd_loc.pack(anchor="w", fill="x", pady=(4, 0))
+        self.cd_detail = self.label(db, "", "body", "text", anchor="w", justify="left", wraplength=1100)
+        self.cd_detail.pack(anchor="w", fill="x", pady=(2, 8))
+        self.cd_area = tk.Frame(db, bg=P["card"])
+        self.cd_area.pack(fill="both", expand=True)
+
+        # diff lado a lado
+        df = self.cd_diff = tk.Frame(self.cd_area, bg=P["card"])
+        df.columnconfigure(0, weight=1, uniform="d")
+        df.columnconfigure(1, weight=1, uniform="d")
+        df.rowconfigure(1, weight=1)
+        res = self.cmp["result"]
+        self.cd_hl = self.label(df, f"BASE  ·  {os.path.basename(res.base.path)}", "caps", "faint", anchor="w")
+        self.cd_hr = self.label(df, f"NUEVO  ·  {os.path.basename(res.new.path)}", "caps", "faint", anchor="w")
+        self.cd_hl.grid(row=0, column=0, sticky="w")
+        self.cd_hr.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.cd_texts = []
+        for col in (0, 1):
+            fr = tk.Frame(df, bg=P["border"])
+            fr.grid(row=1, column=col, sticky="nsew", padx=(8 if col else 0, 0), pady=(2, 0))
+            t = tk.Text(fr, bg=P["code_bg"], fg=P["text"], font=F["mono"], relief="flat", wrap="none", padx=8,
+                        pady=6, highlightthickness=0, bd=0, height=8, selectbackground=P["sel"], cursor="arrow")
+            t.pack(fill="both", expand=True, padx=1, pady=1)
+            cb = P["code_bg"]
+            t.tag_configure("del", background=blend(P["ALTA"], cb, 0.38))
+            t.tag_configure("ins", background=blend(P["ok"], cb, 0.38))
+            t.tag_configure("rdel", background=blend(P["ALTA"], cb, 0.13))
+            t.tag_configure("rins", background=blend(P["ok"], cb, 0.13))
+            t.tag_configure("rchg", background=blend(P["MEDIA"], cb, 0.10))
+            t.tag_configure("pad", background=blend(P["faint"], cb, 0.10))
+            t.tag_configure("ln", foreground=P["faint"])
+            t.tag_configure("note", foreground=P["muted"], font=(F["body"][0], 9, "italic"))
+            t.tag_raise("del")
+            t.tag_raise("ins")
+            t.bind("<MouseWheel>", lambda e: self._cmp_scroll(-1 if e.delta > 0 else 1))
+            t.bind("<Button-4>", lambda e: self._cmp_scroll(-1))
+            t.bind("<Button-5>", lambda e: self._cmp_scroll(1))
+            self.cd_texts.append(t)
+        tl, tr = self.cd_texts
+        self.cd_vs = ttk.Scrollbar(df, orient="vertical", command=lambda *a: [t.yview(*a) for t in self.cd_texts])
+        self.cd_vs.grid(row=1, column=2, sticky="ns")
+        self.cd_hs = ttk.Scrollbar(df, orient="horizontal", command=lambda *a: [t.xview(*a) for t in self.cd_texts])
+        self.cd_hs.grid(row=2, column=0, columnspan=2, sticky="ew")
+        tl.configure(yscrollcommand=self.cd_vs.set, xscrollcommand=self.cd_hs.set)
+
+        # tabla de propiedades
+        pf = self.cd_props = tk.Frame(self.cd_area, bg=P["card"])
+        wrap, self.cd_ptv = self.tree(pf, ("prop", "base", "new"), ("Propiedad", "Base", "Nuevo"),
+                                      (200, 380, 380), height=6, stretch="new")
+        wrap.pack(fill="both", expand=True)
+        self.cd_ptv.tag_configure("chg", background=blend(P["MEDIA"], P["card"], 0.16))
+        self.cd_ptv.tag_configure("Agregado", background=blend(P["ok"], P["card"], 0.08))
+        self.cd_ptv.tag_configure("Eliminado", background=blend(P["ALTA"], P["card"], 0.08))
+        self.show_cmp_detail(None)
+
+    def _cmp_scroll(self, units):
+        for t in self.cd_texts:
+            t.yview_scroll(units * 3, "units")
+        return "break"
+
+    def _cmp_cats(self):
+        res = self.cmp["result"]
+        return [c for c in CMP_CATS if sum(res.by_cat[c].values())] if res else []
+
+    def _cmp_progs(self):
+        res = self.cmp["result"]
+        if not res:
+            return []
+        progs = {c["prog"] for c in res.changes if c["prog"] != "-"}
+        return sorted(progs, key=lambda p: (p != CTRL_SCOPE, p.startswith("AOI "), p.lower()))
+
+    def _cmp_routs(self):
+        res, fl = self.cmp["result"], self.cmp["flt"]
+        progs = self._cmp_progs()
+        prog = progs[fl["prog"] - 1] if fl["prog"] and fl["prog"] <= len(progs) else None
+        return sorted({c["rout"] for c in res.changes if c["rout"] != "-" and (not prog or c["prog"] == prog)},
+                      key=str.lower) if res else []
+
+    def refresh_cmp_filters(self):
+        fl = self.cmp["flt"]
+        lists = ((self.cmp_cb_cat, "cat", ["Todas las categorías"] + self._cmp_cats()),
+                 (self.cmp_cb_prog, "prog", ["Todos los programas / elementos"] + self._cmp_progs()),
+                 (self.cmp_cb_rout, "rout", ["Todas las rutinas"] + self._cmp_routs()))
+        for cb, key, values in lists:
+            cb.configure(values=values)
+            fl[key] = fl[key] if fl[key] < len(values) else 0
+            cb.current(fl[key])
+        for k, p in self.cmp_pills.items():
+            p.active = k in fl["kinds"]
+            p.paint()
+
+    def _cmp_filters_changed(self, source=None):
+        fl = self.cmp["flt"]
+        fl["kinds"] = {k for k, p in self.cmp_pills.items() if p.active}
+        fl["cat"] = max(self.cmp_cb_cat.current(), 0)
+        new_prog = max(self.cmp_cb_prog.current(), 0)
+        fl["rout"] = 0 if new_prog != fl["prog"] else max(self.cmp_cb_rout.current(), 0)
+        fl["prog"] = new_prog
+        fl["q"] = self.cmp_search.value()
+        if source is self.cmp_cb_prog:
+            self.refresh_cmp_filters()
+        self.refresh_cmp_tree()
+
+    def _cmp_set_filter(self, **kw):
+        if self.cmp["result"] is None or not self.cmp["result"].changes:
+            return
+        self.cmp["flt"].update(kw)
+        if "kinds" in kw and "cat" not in kw:
+            self.cmp["flt"]["cat"] = 0
+        self.refresh_cmp_filters()
+        self.refresh_cmp_tree()
+
+    def _cmp_visible(self):
+        res, fl = self.cmp["result"], self.cmp["flt"]
+        cats, progs, routs = self._cmp_cats(), self._cmp_progs(), self._cmp_routs()
+        cat = cats[fl["cat"] - 1] if fl["cat"] and fl["cat"] <= len(cats) else None
+        prog = progs[fl["prog"] - 1] if fl["prog"] and fl["prog"] <= len(progs) else None
+        rout = routs[fl["rout"] - 1] if fl["rout"] and fl["rout"] <= len(routs) else None
+        q = fl["q"].lower().strip()
+        out = []
+        for i, c in enumerate(res.changes):
+            if c["kind"] not in fl["kinds"] or (cat and c["cat"] != cat) or (prog and c["prog"] != prog) \
+                    or (rout and c["rout"] != rout):
+                continue
+            if q:
+                hay = " ".join((c["cat"], c["prog"], c["rout"], c["item"], c["loc"], c["detail"],
+                                c["base"] if isinstance(c["base"], str) else "",
+                                c["new"] if isinstance(c["new"], str) else "")).lower()
+                if q not in hay:
+                    continue
+            out.append(i)
+        return out
+
+    def refresh_cmp_tree(self):
+        tv = self.cmp_tv
+        tv.delete(*tv.get_children())
+        view = self.cmp["view"] = self._cmp_visible()
+        changes = self.cmp["result"].changes
+        self.cmp["gen"] += 1
+        gen = self.cmp["gen"]
+        self.cmp_count.configure(text=f"{len(view):,} de {len(changes):,} visibles")
+
+        def fill(start):
+            if gen != self.cmp["gen"] or not tv.winfo_exists():
+                return
+            end = min(start + 400, len(view))
+            for i in view[start:end]:
+                c = changes[i]
+                tv.insert("", "end", iid=str(i), tags=(c["kind"],), values=(
+                    c["kind"], c["cat"], c["prog"], c["rout"], c["item"], c["loc"], c["detail"]))
+            if end < len(view):
+                self.root.after(1, lambda: fill(end))
+            elif self.cmp["current"] is not None and tv.exists(str(self.cmp["current"])):
+                tv.selection_set(str(self.cmp["current"]))
+                tv.see(str(self.cmp["current"]))
+        fill(0)
+        if self.cmp["current"] not in view:
+            self.cmp["current"] = None
+            self.show_cmp_detail(None)
+
+    def _cmp_on_select(self):
+        sel = self.cmp_tv.selection()
+        self.cmp["current"] = int(sel[0]) if sel else None
+        self.show_cmp_detail(self.cmp["result"].changes[self.cmp["current"]] if sel else None)
+
+    def show_cmp_detail(self, c):
+        P = self.P
+        self.cd_diff.pack_forget()
+        self.cd_props.pack_forget()
+        if c is None:
+            self.cd_badge.configure(text="", bg=P["card"])
+            self.cd_title.configure(text="Selecciona un cambio para ver el detalle")
+            self.cd_loc.configure(text="")
+            self.cd_detail.configure(text="")
+            return
+        self.cd_badge.configure(text=c["kind"].upper(), bg=P[self.KIND_COLORS[c["kind"]]], fg="#ffffff")
+        self.cd_title.configure(text=c["item"])
+        where = "  ›  ".join(x for x in (c["cat"], c["prog"], c["rout"], c["loc"]) if x and x != "-")
+        self.cd_loc.configure(text=where)
+        self.cd_detail.configure(text=c["detail"])
+        if c["mode"] == "props":
+            tv = self.cd_ptv
+            tv.delete(*tv.get_children())
+            for k, va, vb, changed in c["props"]:
+                tag = "chg" if changed else (c["kind"] if c["kind"] != "Modificado" else "")
+                tv.insert("", "end", values=(prop_label(k), "" if va is None else _norm_ws(str(va)),
+                                             "" if vb is None else _norm_ws(str(vb))), tags=(tag,) if tag else ())
+            self.cd_props.pack(fill="both", expand=True)
+        elif c["mode"] in ("tokens", "lines"):
+            self._render_diff(c)
+            self.cd_diff.pack(fill="both", expand=True)
+
+    def _render_diff(self, c):
+        rows = diff_rows(c)
+        numbered = c["mode"] == "lines"
+        width = max((len(str(s[0])) for r in rows for s in r if s and s[0] is not None), default=1)
+        for t in self.cd_texts:
+            t.configure(state="normal", wrap="word" if c["mode"] == "tokens" else "none")
+            t.delete("1.0", "end")
+        tl, tr = self.cd_texts
+        for left, right in rows:
+            for t, side, other in ((tl, left, right), (tr, right, left)):
+                if side is None:
+                    msg = "" if numbered else ("(no existe en Base)" if t is tl else "(no existe en Nuevo)")
+                    t.insert("end", msg, "note")
+                    t.insert("end", "\n", "pad")
+                    continue
+                num, segs, style = side
+                row_tag = ("r" + style,) if style else ()
+                if numbered:
+                    t.insert("end", f"{'' if num is None else num:>{width}}  ", ("ln",) + row_tag)
+                for text, tag in segs:
+                    t.insert("end", text, ((tag,) if tag else ()) + row_tag)
+                t.insert("end", "\n", row_tag)
+        if len(rows) >= 3000:
+            for t in self.cd_texts:
+                t.insert("end", "\n… diferencia recortada a 3000 líneas", "note")
+        first = next((i for i, (l, r) in enumerate(rows) if (l and l[2]) or (r and r[2]) or l is None or r is None), 0)
+        for t in self.cd_texts:
+            t.configure(state="disabled")
+            t.yview_moveto(0)
+            if first > 3:
+                t.see(f"{first + 1}.0")
+
+    # --- exportacion ---
+    def export_compare_menu(self):
+        if self.cmp["result"] is None or self.busy:
+            self.toast("Primero ejecuta una comparación", "MEDIA")
+            return
+        m = self.menu()
+        m.add_command(label="Informe HTML (recomendado)", accelerator="Ctrl+E",
+                      command=lambda: self.export_compare("html"))
+        m.add_command(label="Excel (.xlsx)" + ("" if xlsx_available() else "  - requiere openpyxl"),
+                      command=lambda: self.export_compare("xlsx"),
+                      state="normal" if xlsx_available() else "disabled")
+        m.add_separator()
+        m.add_checkbutton(label="Exportar solo la vista filtrada", variable=self.only_view,
+                          selectcolor=self.P["accent"])
+        b = self.btn_export
+        m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 2)
+
+    def export_compare(self, kind):
+        res = self.cmp["result"]
+        if res is None or self.busy:
+            if res is None:
+                self.toast("Primero ejecuta una comparación", "MEDIA")
+            return
+        changes = [res.changes[i] for i in self.cmp["view"]] if self.only_view.get() and self.cmp["view"] \
+            else res.changes
+        ext = {"html": ".html", "xlsx": ".xlsx"}[kind]
+        base = f"comparacion_{os.path.splitext(os.path.basename(res.new.path))[0]}"
+        dest = filedialog.asksaveasfilename(
+            parent=self.root, title="Guardar comparación como", defaultextension=ext,
+            initialdir=self.cfg.get("last_export_dir") or self.cfg.get("last_dir") or None,
+            initialfile=f"{base}_{datetime.now():%Y%m%d_%H%M}{ext}",
+            filetypes=[("Informe HTML" if kind == "html" else "Excel", "*" + ext)])
+        if not dest:
+            return
+        self.cfg["last_export_dir"] = os.path.dirname(dest)
+        save_config(self.cfg)
+        try:
+            CMP_EXPORTERS[kind](dest, res, changes)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"No se pudo exportar:\n{exc}", parent=self.root)
+            return
+        self.log(f"Comparación exportada a {kind.upper()} ({len(changes)} cambios): {dest}")
+        self.toast(f"Reporte guardado\n{os.path.basename(dest)}", "ok")
+        if kind == "html":
+            webbrowser.open("file://" + os.path.abspath(dest))
+
+    def _sync_export_btn(self):
+        ready = self.cmp["result"] is not None if self.page == "comparar" else bool(self.results)
+        if getattr(self, "btn_export", None) is not None and self.btn_export.winfo_exists():
+            self.btn_export.set_enabled(ready and not self.busy)
+
     def export_menu(self):
+        if self.page == "comparar":
+            return self.export_compare_menu()
         if not self.btn_export.enabled:
             if not self.results:
                 self.toast("Primero analiza al menos un archivo", "MEDIA")
